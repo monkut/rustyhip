@@ -41,3 +41,17 @@ data/*
 # Cached toolchain/docs
 .cargo-cache/
 docs-build/
+
+# Python / uv (tools/django-seed)
+.venv/
+__pycache__/
+*.pyc
+
+# SQLite local-only databases (tests + seed projects)
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Generated deploy artifacts
+template.yaml
