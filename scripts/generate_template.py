@@ -75,6 +75,16 @@ def build_template(
                 "Description": "Turbolite prefix (logical database name) within the bucket.",
                 "MinLength": 1,
             },
+            "AuthToken": {
+                "Type": "String",
+                "NoEcho": True,
+                "Description": (
+                    "Bearer token that every /sql and /health request must present as "
+                    "`Authorization: Bearer <token>`. Required — the handler refuses to serve "
+                    "anonymous traffic in any deployed environment."
+                ),
+                "MinLength": 16,
+            },
         },
         "Resources": {
             api_logical_id: {
@@ -103,6 +113,7 @@ def build_template(
                         "Variables": {
                             "BUCKET": {"Ref": "BucketName"},
                             "DB_NAME": {"Ref": "DbName"},
+                            "RUSTYHIP_AUTH_TOKEN": {"Ref": "AuthToken"},
                             "LOG_LEVEL": log_level,
                         },
                     },

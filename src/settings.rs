@@ -36,6 +36,9 @@ pub const ENV_CACHE_DIR: &str = "DB_CACHE_DIR";
 pub const ENV_ENVIRONMENT: &str = "ENVIRONMENT";
 /// Environment variable selecting the log output format (`json` | `pretty`). Defaults to `json`.
 pub const ENV_LOG_FORMAT: &str = "LOG_FORMAT";
+/// Environment variable holding the bearer token every request must present.
+/// Unset / empty = auth disabled (local dev only; startup logs a warning).
+pub const ENV_AUTH_TOKEN: &str = "RUSTYHIP_AUTH_TOKEN";
 /// Standard AWS SDK override for the service endpoint. When set, force S3 path-style addressing.
 pub const ENV_AWS_ENDPOINT_URL: &str = "AWS_ENDPOINT_URL";
 /// Per-service override for the S3 endpoint URL.
@@ -84,6 +87,15 @@ pub fn log_format() -> String {
 #[must_use]
 pub fn use_path_style_s3() -> bool {
     std::env::var(ENV_AWS_ENDPOINT_URL).is_ok() || std::env::var(ENV_AWS_ENDPOINT_URL_S3).is_ok()
+}
+
+/// Bearer token every HTTP request must present in the `Authorization` header.
+///
+/// `None` when the env var is unset or empty — auth is disabled. The main
+/// bootstrap logs a warning on startup when that happens.
+#[must_use]
+pub fn auth_token() -> Option<String> {
+    std::env::var(ENV_AUTH_TOKEN).ok().filter(|s| !s.is_empty())
 }
 
 /// Initialize tracing. Idempotent — safe to call from both `lib` and `bin`.

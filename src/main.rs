@@ -17,7 +17,7 @@ use lambda_http::{Error, run, service_fn};
 use rustyhip::logging::elapsed_ms;
 use rustyhip::state::AppState;
 use rustyhip::{VERSION, db::SqliteDb, handler, settings};
-use tracing::info;
+use tracing::{info, warn};
 use turbolite::tiered::{TurboliteConfig, TurboliteVfs, register};
 
 const VFS_NAME: &str = "tiered";
@@ -59,7 +59,15 @@ async fn main() -> Result<(), Error> {
 
     let db_path = cache_dir.join("rustyhip.db");
     let db = Arc::new(SqliteDb::open_with_vfs(db_path, VFS_NAME).context("open db via turbolite VFS")?);
-    let state = Arc::new(AppState::new(db));
+
+    let auth_token = settings::auth_token();
+    if auth_token.is_none() {
+        warn!(
+            "RUSTYHIP_AUTH_TOKEN unset — the /sql endpoint will accept anonymous traffic. \
+             Set the env var before exposing this Lambda outside local dev."
+        );
+    }
+    let state = Arc::new(AppState::new(db, auth_token));
 
     info!(op = "bootstrap", phase = "end", duration_ms = elapsed_ms(started), "END bootstrap");
 

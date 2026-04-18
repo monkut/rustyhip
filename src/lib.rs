@@ -2,6 +2,7 @@
 //! backed by the turbolite tiered VFS.
 
 pub mod db;
+pub mod errors;
 pub mod handler;
 pub mod logging;
 pub mod settings;

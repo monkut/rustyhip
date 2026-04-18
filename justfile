@@ -116,13 +116,13 @@ lambda-deploy FUNCTION="rhp-rustyhip":
 template-gen *FLAGS:
     uv run scripts/generate_template.py --output template.yaml {{FLAGS}}
 
-# Deploy via SAM (requires `sam` CLI + AWS creds + Bucket/DbName overrides).
-template-deploy STACK="rhp-rustyhip" BUCKET="" DB_NAME="":
+# Deploy via SAM (requires `sam` CLI + AWS creds + Bucket/DbName/AuthToken overrides).
+template-deploy STACK="rhp-rustyhip" BUCKET="" DB_NAME="" AUTH_TOKEN="":
     sam deploy --template-file template.yaml \
         --stack-name {{STACK}} \
         --capabilities CAPABILITY_IAM \
         --resolve-s3 \
-        --parameter-overrides BucketName={{BUCKET}} DbName={{DB_NAME}}
+        --parameter-overrides BucketName={{BUCKET}} DbName={{DB_NAME}} AuthToken={{AUTH_TOKEN}}
 
 # ---- AWS helpers ----
 create-project-bucket:

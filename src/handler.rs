@@ -6,17 +6,25 @@
 //!   `POST /sql`     → `{"sql": "...", "params": [...]?}`
 //!                   → `{"columns": [...], "rows": [...], "rowcount": N, "lastrowid": M, "readonly": bool}`
 //!
+//! Auth: when `RUSTYHIP_AUTH_TOKEN` is set, every request (including `/health`)
+//! must carry `Authorization: Bearer <token>`. Requests without a matching
+//! token get `401` + structured error body. When the env var is unset the
+//! handler accepts anonymous traffic (dev-only; bootstrap logs a warning).
+//!
+//! Error responses all follow the same shape:
+//!     `{"error": {"code": "RUSTYHIP_E_*", "message": "...", "request_id": "..."}}`
 //! Writes are persisted to S3 by the underlying turbolite VFS — the handler
 //! itself does no S3 I/O.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use lambda_http::{Body, Error, Request, Response, http::StatusCode};
+use lambda_http::{Body, Error, Request, RequestExt, Response, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::VERSION;
+use crate::errors;
 use crate::logging::elapsed_ms;
 use crate::state::AppState;
 
@@ -29,7 +37,14 @@ pub struct SqlRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
-    pub error: String,
+    pub error: ErrorBody,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ErrorBody {
+    pub code: &'static str,
+    pub message: String,
+    pub request_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,12 +58,21 @@ pub async fn handle(state: Arc<AppState>, req: Request) -> Result<Response<Body>
     let started = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
-    info!(op = "handle_request", phase = "start", %method, %path, "START handle_request");
+    let request_id = extract_request_id(&req);
+    info!(op = "handle_request", phase = "start", %method, %path, %request_id, "START handle_request");
 
-    let result = match (method.as_str(), path.as_str()) {
-        ("GET", "/" | "/health") => health(),
-        ("POST", "/sql") => sql(state.as_ref(), req.body()).await,
-        _ => json_response(StatusCode::NOT_FOUND, &ErrorResponse { error: format!("no route for {method} {path}") }),
+    let result = match check_auth(&state, &req, &request_id) {
+        Err(resp) => Ok(resp),
+        Ok(()) => match (method.as_str(), path.as_str()) {
+            ("GET", "/" | "/health") => health(),
+            ("POST", "/sql") => sql(state.as_ref(), req.body(), &request_id).await,
+            _ => json_error(
+                StatusCode::NOT_FOUND,
+                errors::NOT_FOUND,
+                format!("no route for {method} {path}"),
+                &request_id,
+            ),
+        },
     };
 
     let status = result.as_ref().map_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.as_u16(), |r| r.status().as_u16());
@@ -59,6 +83,7 @@ pub async fn handle(state: Arc<AppState>, req: Request) -> Result<Response<Body>
         status,
         %method,
         %path,
+        %request_id,
         "END handle_request"
     );
     result
@@ -68,13 +93,42 @@ fn health() -> Result<Response<Body>, Error> {
     json_response(StatusCode::OK, &HealthResponse { version: VERSION, status: "ok" })
 }
 
-async fn sql(state: &AppState, body: &Body) -> Result<Response<Body>, Error> {
+/// Returns `Err(response)` when auth fails — caller short-circuits with it.
+/// The Err variant intentionally carries a full `Response<Body>` so the caller
+/// can return it verbatim; clippy's `result_large_err` is noise here.
+#[allow(clippy::result_large_err)]
+fn check_auth(state: &AppState, req: &Request, request_id: &str) -> Result<(), Response<Body>> {
+    let Some(expected) = state.auth_token.as_deref() else {
+        return Ok(());
+    };
+    let provided = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")));
+    if provided == Some(expected) {
+        return Ok(());
+    }
+    warn!(%request_id, "auth failed — rejecting request");
+    let resp = json_error(
+        StatusCode::UNAUTHORIZED,
+        errors::UNAUTHORIZED,
+        "invalid or missing bearer token".into(),
+        request_id,
+    )
+    .unwrap_or_else(|_| {
+        Response::builder().status(StatusCode::UNAUTHORIZED).body(Body::Empty).expect("static 401 response")
+    });
+    Err(resp)
+}
+
+async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response<Body>, Error> {
     let bytes: &[u8] = body.as_ref();
     let req: SqlRequest = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "invalid JSON request body");
-            return json_response(StatusCode::BAD_REQUEST, &ErrorResponse { error: format!("invalid JSON: {e}") });
+            return json_error(StatusCode::BAD_REQUEST, errors::VALIDATION, format!("invalid JSON: {e}"), request_id);
         }
     };
     let started = Instant::now();
@@ -83,6 +137,7 @@ async fn sql(state: &AppState, body: &Body) -> Result<Response<Body>, Error> {
         phase = "start",
         sql_bytes = req.sql.len(),
         param_count = req.params.len(),
+        %request_id,
         "START handle_sql"
     );
     debug!(op = "handle_sql", sql = %req.sql, "sql text");
@@ -104,9 +159,11 @@ async fn sql(state: &AppState, body: &Body) -> Result<Response<Body>, Error> {
                         outcome = "checkpoint_error",
                         "END handle_sql"
                     );
-                    return json_response(
+                    return json_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        &ErrorResponse { error: format!("checkpoint failed: {e:#}") },
+                        errors::INTERNAL,
+                        format!("checkpoint failed: {e:#}"),
+                        request_id,
                     );
                 }
             }
@@ -126,7 +183,7 @@ async fn sql(state: &AppState, body: &Body) -> Result<Response<Body>, Error> {
         Err(e) => {
             error!(error = ?e, "sql exec failed");
             // `{:#}` surfaces the full anyhow context chain (e.g. "prepare statement: no such table: foo").
-            let resp = json_response(StatusCode::BAD_REQUEST, &ErrorResponse { error: format!("{e:#}") });
+            let resp = json_error(StatusCode::BAD_REQUEST, errors::SQL, format!("{e:#}"), request_id);
             info!(
                 op = "handle_sql",
                 phase = "end",
@@ -145,6 +202,27 @@ fn json_response<T: Serialize>(status: StatusCode, payload: &T) -> Result<Respon
     Ok(resp)
 }
 
+fn json_error(
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    request_id: &str,
+) -> Result<Response<Body>, Error> {
+    json_response(status, &ErrorResponse { error: ErrorBody { code, message, request_id: request_id.to_owned() } })
+}
+
+fn extract_request_id(req: &Request) -> String {
+    // In production `lambda_http` exposes the AWS-assigned request id via the
+    // Lambda context. When absent (unit tests, local tooling) we fall back to
+    // a timestamp-derived id so every log + error body still has something
+    // traceable.
+    if let Some(ctx) = req.lambda_context_ref() {
+        return ctx.request_id.clone();
+    }
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    format!("local-{nanos}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,20 +230,19 @@ mod tests {
     use lambda_http::http::Request as HttpRequest;
     use tempfile::TempDir;
 
-    fn make_state() -> (TempDir, Arc<AppState>) {
+    fn make_state(auth: Option<&str>) -> (TempDir, Arc<AppState>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("rustyhip.db");
         let db = Arc::new(SqliteDb::open(db_path).expect("open sqlite"));
-        (dir, Arc::new(AppState::new(db)))
+        (dir, Arc::new(AppState::new(db, auth.map(str::to_owned))))
     }
 
-    fn make_request(method: &str, path: &str, body: &str) -> Request {
-        HttpRequest::builder()
-            .method(method)
-            .uri(path)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_owned()))
-            .expect("build request")
+    fn make_request(method: &str, path: &str, body: &str, auth_header: Option<&str>) -> Request {
+        let mut builder = HttpRequest::builder().method(method).uri(path).header("content-type", "application/json");
+        if let Some(token) = auth_header {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body.to_owned())).expect("build request")
     }
 
     fn parse_body(resp: &Response<Body>) -> serde_json::Value {
@@ -173,15 +250,15 @@ mod tests {
         serde_json::from_slice(bytes).expect("json body")
     }
 
-    /// State backed by an in-memory `SQLite` DB — fine for tests that never hit `/sql`.
+    /// State backed by an in-memory `SQLite` DB with auth disabled.
     fn dummy_state() -> Arc<AppState> {
         let db = Arc::new(SqliteDb::open(":memory:").expect("open in-memory sqlite"));
-        Arc::new(AppState::new(db))
+        Arc::new(AppState::new(db, None))
     }
 
     #[tokio::test]
     async fn health_returns_ok_with_version() {
-        let resp = handle(dummy_state(), make_request("GET", "/health", "")).await.expect("handler");
+        let resp = handle(dummy_state(), make_request("GET", "/health", "", None)).await.expect("handler");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = parse_body(&resp);
         assert_eq!(body["status"], "ok");
@@ -190,30 +267,57 @@ mod tests {
 
     #[tokio::test]
     async fn root_also_returns_health() {
-        let resp = handle(dummy_state(), make_request("GET", "/", "")).await.expect("handler");
+        let resp = handle(dummy_state(), make_request("GET", "/", "", None)).await.expect("handler");
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn sql_rejects_invalid_json() {
-        let resp = handle(dummy_state(), make_request("POST", "/sql", "not json")).await.expect("handler");
+        let resp = handle(dummy_state(), make_request("POST", "/sql", "not json", None)).await.expect("handler");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = parse_body(&resp);
+        assert_eq!(body["error"]["code"], errors::VALIDATION);
+        assert!(!body["error"]["request_id"].as_str().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn unknown_route_returns_404() {
-        let resp = handle(dummy_state(), make_request("GET", "/nope", "")).await.expect("handler");
+    async fn unknown_route_returns_404_with_error_code() {
+        let resp = handle(dummy_state(), make_request("GET", "/nope", "", None)).await.expect("handler");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = parse_body(&resp);
+        assert_eq!(body["error"]["code"], errors::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn missing_bearer_returns_401() {
+        let (_dir, state) = make_state(Some("expected-token"));
+        let resp = handle(state, make_request("GET", "/health", "", None)).await.expect("handler");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = parse_body(&resp);
+        assert_eq!(body["error"]["code"], errors::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_bearer_returns_401() {
+        let (_dir, state) = make_state(Some("expected-token"));
+        let resp = handle(state, make_request("GET", "/health", "", Some("wrong-token"))).await.expect("handler");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn matching_bearer_passes_through() {
+        let (_dir, state) = make_state(Some("expected-token"));
+        let resp = handle(state, make_request("GET", "/health", "", Some("expected-token"))).await.expect("handler");
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn readonly_select_works_through_default_vfs() {
-        let (_dir, state) = make_state();
-        // Seed via the same connection the handler uses — a second Connection::open
-        // on the same file would clash with the still-held primary connection.
+        let (_dir, state) = make_state(None);
         state.db.exec("CREATE TABLE t (x INT)".into(), vec![]).await.expect("create");
         state.db.exec("INSERT INTO t VALUES (1)".into(), vec![]).await.expect("insert");
-        let resp = handle(state, make_request("POST", "/sql", r#"{"sql":"SELECT x FROM t"}"#)).await.expect("handler");
+        let resp =
+            handle(state, make_request("POST", "/sql", r#"{"sql":"SELECT x FROM t"}"#, None)).await.expect("handler");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = parse_body(&resp);
         assert_eq!(body["readonly"], true);

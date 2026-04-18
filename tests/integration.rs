@@ -15,7 +15,10 @@ fn test_state() -> (TempDir, Arc<AppState>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("rustyhip.db");
     let db = Arc::new(SqliteDb::open(db_path).expect("open sqlite"));
-    (dir, Arc::new(AppState::new(db)))
+    // Auth disabled for integration tests — the dedicated auth tests live in
+    // `src/handler.rs::tests` where the handler module has access to the
+    // internal helpers.
+    (dir, Arc::new(AppState::new(db, None)))
 }
 
 fn post_sql(body: &str) -> Request {
@@ -63,5 +66,8 @@ async fn sql_against_missing_table_returns_400() {
     let resp = handle(state, post_sql(r#"{"sql":"SELECT * FROM does_not_exist"}"#)).await.expect("handler");
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = serde_json::from_slice(resp.body().as_ref()).unwrap();
-    assert!(body["error"].as_str().unwrap().to_lowercase().contains("no such table"));
+    let err = &body["error"];
+    assert_eq!(err["code"], "RUSTYHIP_E_SQL");
+    assert!(err["message"].as_str().unwrap().to_lowercase().contains("no such table"));
+    assert!(!err["request_id"].as_str().unwrap().is_empty());
 }
