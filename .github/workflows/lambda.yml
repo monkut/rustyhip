@@ -23,6 +23,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # cargo-lambda needs zig to cross-compile for the Lambda arm64 target.
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-lambda
