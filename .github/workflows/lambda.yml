@@ -1,0 +1,40 @@
+name: Lambda build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: cargo lambda build (arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # cargo-lambda needs zig to cross-compile for the Lambda arm64 target.
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-lambda
+      - name: cargo lambda build --release --arm64
+        run: cargo lambda build --release --arm64
+      - name: Upload bootstrap artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustyhip-lambda-arm64
+          path: target/lambda/rustyhip/bootstrap
+          if-no-files-found: error

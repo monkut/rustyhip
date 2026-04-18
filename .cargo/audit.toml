@@ -1,0 +1,14 @@
+# cargo-audit — https://rustsec.org/
+# Mirrors the `[advisories].ignore` list in deny.toml. Keep the two in sync.
+# See deny.toml for the rationale behind each ignore.
+
+[advisories]
+ignore = [
+  "RUSTSEC-2025-0134",
+  "RUSTSEC-2026-0009",
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
+  "RUSTSEC-2024-0375",
+  "RUSTSEC-2021-0145",
+  "RUSTSEC-2026-0002",
+]

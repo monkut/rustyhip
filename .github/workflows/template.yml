@@ -1,0 +1,57 @@
+name: Generate SAM template
+
+on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: Lambda architecture
+        required: false
+        type: choice
+        default: arm64
+        options: [arm64, x86_64]
+      memory-mb:
+        description: Lambda MemorySize (MiB)
+        required: false
+        default: "512"
+      timeout-s:
+        description: Lambda Timeout (seconds)
+        required: false
+        default: "30"
+  pull_request:
+    paths:
+      - "scripts/generate_template.py"
+      - ".github/workflows/template.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/generate_template.py"
+      - ".github/workflows/template.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate:
+    name: uv run generate_template.py
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Generate template.yaml
+        run: |
+          uv run scripts/generate_template.py \
+            --architecture "${{ github.event.inputs.architecture || 'arm64' }}" \
+            --memory-mb "${{ github.event.inputs.memory-mb || '512' }}" \
+            --timeout-s "${{ github.event.inputs.timeout-s || '30' }}" \
+            --output template.yaml
+      - name: Install cfn-lint
+        run: uv tool install cfn-lint
+      - name: Validate template
+        run: cfn-lint template.yaml
+      - name: Upload template artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustyhip-sam-template
+          path: template.yaml
+          if-no-files-found: error

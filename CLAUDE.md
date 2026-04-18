@@ -1,5 +1,31 @@
 This project uses the lambda rust runtime to provide sqlite-like DB access over s3
 
+## AWS Development Target
+
+Development deployments target the **internaldevelopment** account.
+
+- Profile: `internaldevelopmentadministratoraccess`
+    - Account: 517277520535
+    - Role: `internal-development-adminAdministratorAccess`
+    - Region: `ap-northeast-1`
+- View-only profile: `internaldevelopmentadminviewonlyaccess` (same account)
+
+### AWS Access via aws-vault
+
+AWS commands are made through the `awscli`, executed via `aws-vault exec`.
+If not yet authorized, the user will be prompted to authorize.
+
+Example:
+
+    aws-vault exec internaldevelopmentadministratoraccess -- aws sts get-caller-identity
+    # Expected Account: 517277520535
+
+Deployment example:
+
+    export AWS_PROFILE=internaldevelopmentadministratoraccess
+    export AWS_REGION=ap-northeast-1
+    aws-vault exec $AWS_PROFILE -- <deploy command>
+
 ## Skill routing
 
 When the user's request matches an available skill, ALWAYS invoke it using the Skill
