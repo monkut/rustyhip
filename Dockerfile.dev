@@ -1,0 +1,45 @@
+# Dev-only container for running rustyhip via `cargo lambda watch`.
+#
+# Serves the Lambda runtime API on :9000, same as `just rustyhip-dev` on the
+# host — but inside docker so downstream projects (e.g. reception-backend)
+# can depend on it from their docker-compose.yaml.
+#
+# Not suitable for production — for real deploy build the binary with
+# `cargo lambda build --release --arm64` and bake into
+# public.ecr.aws/lambda/provided:al2023.
+
+FROM rust:1.90-bookworm
+
+# cargo-lambda needs zig for cross-compile. We're building natively inside
+# the container, so zig is strictly only needed when someone runs a release
+# build — install it anyway for parity with the host toolchain.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3-pip python3-venv curl ca-certificates pkg-config libssl-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && python3 -m venv /opt/zig-venv \
+ && /opt/zig-venv/bin/pip install --no-cache-dir ziglang==0.16.0 \
+ && ln -s /opt/zig-venv/bin/python-zig /usr/local/bin/zig
+
+# cargo-lambda. Install from crates.io — slow on first build (~3-5 min) but
+# cached on subsequent rebuilds thanks to BuildKit layer caching.
+RUN cargo install --locked cargo-lambda
+
+WORKDIR /app
+
+# Pre-fetch dependencies into a cacheable layer before copying source. If
+# Cargo.toml / Cargo.lock change, this layer rebuilds; otherwise it stays
+# warm across source-only edits.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo ./.cargo
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
+ && echo '' > src/lib.rs \
+ && cargo fetch \
+ && rm -rf src
+
+COPY . .
+
+EXPOSE 9000
+
+# Re-run the build on every container start. `cargo lambda watch` rebuilds
+# incrementally on file change when the source dir is volume-mounted.
+CMD ["cargo", "lambda", "watch", "--invoke-address", "0.0.0.0"]
