@@ -1,0 +1,32 @@
+# Dev-only container for running rustyhip via `cargo lambda watch`.
+#
+# Serves the Lambda runtime API on :9000, same as `just rustyhip-dev` on the
+# host — but inside docker so downstream projects (e.g. reception-backend)
+# can depend on it from their docker-compose.yaml.
+#
+# Not suitable for production — for real deploy build the binary with
+# `cargo lambda build --release --arm64` and bake into
+# public.ecr.aws/lambda/provided:al2023.
+
+FROM rust:1.90-bookworm
+
+# `cargo lambda watch` does native debug builds — no zig cross-compile needed.
+# Release arm64 builds happen in CI (see .github/workflows/lambda.yml).
+RUN cargo install --locked cargo-lambda
+
+WORKDIR /app
+
+# Pre-fetch deps into a cacheable layer. Source edits under src/ don't
+# invalidate this layer — only Cargo.toml / Cargo.lock changes do.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo ./.cargo
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
+ && echo '' > src/lib.rs \
+ && cargo fetch \
+ && rm -rf src
+
+COPY . .
+
+EXPOSE 9000
+
+CMD ["cargo", "lambda", "watch", "--invoke-address", "0.0.0.0"]
