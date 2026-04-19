@@ -123,7 +123,7 @@ verify-django-rustyhip BUCKET="rustyhip-dev" DB_NAME="rustyhip":
     export LOG_FORMAT=pretty LOG_LEVEL=info ENVIRONMENT=development
 
     echo "[2/6] Wiping stale state (local sqlite + turbolite cache + S3 prefix) for a fresh run..."
-    rm -f tools/django-seed/db.sqlite3
+    rm -f tools/sample-django/db.sqlite3
     rm -rf /tmp/rustyhip-cache
     aws s3 rm s3://{{BUCKET}}/{{DB_NAME}}/ --recursive >/dev/null 2>&1 || true
 
@@ -139,7 +139,7 @@ verify-django-rustyhip BUCKET="rustyhip-dev" DB_NAME="rustyhip":
     echo "       rustyhip ready on :9000 (pid $RUSTYHIP_PID)"
 
     echo "[4/6] Django migrate via django-rustyhip backend..."
-    pushd tools/django-seed >/dev/null
+    pushd tools/sample-django >/dev/null
     uv sync -q
     RUSTYHIP_ENDPOINT=http://localhost:9000 uv run python manage.py migrate --no-input
 
@@ -159,8 +159,8 @@ verify-django-rustyhip BUCKET="rustyhip-dev" DB_NAME="rustyhip":
         echo "FAIL: expected multiple turbolite objects, found $n" >&2
         exit 1
     fi
-    if [ -f tools/django-seed/db.sqlite3 ]; then
-        echo "FAIL: tools/django-seed/db.sqlite3 was created — django-rustyhip did not route to rustyhip" >&2
+    if [ -f tools/sample-django/db.sqlite3 ]; then
+        echo "FAIL: tools/sample-django/db.sqlite3 was created — django-rustyhip did not route to rustyhip" >&2
         exit 1
     fi
     echo ""
