@@ -45,7 +45,7 @@ dev = [
 ]
 
 [[package]]
-name = "django-seed"
+name = "sample-django"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

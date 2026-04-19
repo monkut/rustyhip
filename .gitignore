@@ -42,12 +42,12 @@ data/*
 .cargo-cache/
 docs-build/
 
-# Python / uv (tools/django-seed)
+# Python / uv (tools/sample-django)
 .venv/
 __pycache__/
 *.pyc
 
-# SQLite local-only databases (tests + seed projects)
+# SQLite local-only databases (tests + sample projects)
 *.sqlite3
 *.sqlite3-journal
 *.sqlite3-wal
