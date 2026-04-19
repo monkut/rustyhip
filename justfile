@@ -95,6 +95,77 @@ rustyhip-dev BUCKET="rustyhip-dev" DB_NAME="rustyhip":
     export LOG_FORMAT=pretty LOG_LEVEL=info ENVIRONMENT=development
     cargo lambda watch
 
+# End-to-end verification that django-rustyhip routes Django ORM traffic to
+# rustyhip, which in turn shards the DB across turbolite-managed objects in S3
+# (floci). Starts rustyhip in the background, runs `manage.py migrate` + a
+# CRUD round-trip against it, then lists the turbolite objects to prove the
+# DB is *not* a single sqlite3 file. Fails if a local db.sqlite3 appears,
+# which would mean the django-rustyhip backend silently fell back to sqlite3.
+#
+# First run cold-starts `cargo lambda watch` (~2-5 min). Subsequent runs reuse
+# target/ and finish in under a minute. Logs: /tmp/rustyhip-verify.log.
+verify-django-rustyhip BUCKET="rustyhip-dev" DB_NAME="rustyhip":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "[1/6] Ensuring floci + bucket..."
+    curl -sf http://localhost:4566/ >/dev/null 2>&1 || just floci-up
+    just floci-seed {{BUCKET}} >/dev/null
+
+    if curl -sf http://localhost:9000/health 2>/dev/null | grep -q '"status":"ok"'; then
+        echo "ERROR: something already answering on :9000 — stop it so we can start a clean rustyhip." >&2
+        exit 1
+    fi
+
+    export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
+    export AWS_ENDPOINT_URL=http://localhost:4566
+    export BUCKET={{BUCKET}} DB_NAME={{DB_NAME}}
+    export LOG_FORMAT=pretty LOG_LEVEL=info ENVIRONMENT=development
+
+    echo "[2/6] Wiping stale state (local sqlite + turbolite cache + S3 prefix) for a fresh run..."
+    rm -f tools/django-seed/db.sqlite3
+    rm -rf /tmp/rustyhip-cache
+    aws s3 rm s3://{{BUCKET}}/{{DB_NAME}}/ --recursive >/dev/null 2>&1 || true
+
+    echo "[3/6] Starting rustyhip (cargo lambda watch → /tmp/rustyhip-verify.log)..."
+    cargo lambda watch >/tmp/rustyhip-verify.log 2>&1 &
+    RUSTYHIP_PID=$!
+    cleanup() {
+        kill "$RUSTYHIP_PID" 2>/dev/null || true
+        wait "$RUSTYHIP_PID" 2>/dev/null || true
+    }
+    trap cleanup EXIT
+    timeout 600 bash -c 'until curl -sf http://localhost:9000/health 2>/dev/null | grep -q "\"status\":\"ok\""; do sleep 2; done'
+    echo "       rustyhip ready on :9000 (pid $RUSTYHIP_PID)"
+
+    echo "[4/6] Django migrate via django-rustyhip backend..."
+    pushd tools/django-seed >/dev/null
+    uv sync -q
+    RUSTYHIP_ENDPOINT=http://localhost:9000 uv run python manage.py migrate --no-input
+
+    echo "[5/6] CRUD round-trip (INSERT + COUNT) via rustyhip..."
+    RUSTYHIP_ENDPOINT=http://localhost:9000 uv run python manage.py shell -c "
+    from django.contrib.auth.models import User
+    User.objects.get_or_create(username='rustyhip-smoke')
+    print(f'user count = {User.objects.count()}')
+    "
+    popd >/dev/null
+
+    echo "[6/6] Verifying S3 representation (expect multiple turbolite objects, no single sqlite file)..."
+    echo "       Objects under s3://{{BUCKET}}/{{DB_NAME}}/:"
+    aws s3 ls s3://{{BUCKET}}/{{DB_NAME}}/ --recursive | sed 's/^/         /'
+    n=$(aws s3 ls s3://{{BUCKET}}/{{DB_NAME}}/ --recursive | wc -l)
+    if [ "$n" -lt 2 ]; then
+        echo "FAIL: expected multiple turbolite objects, found $n" >&2
+        exit 1
+    fi
+    if [ -f tools/django-seed/db.sqlite3 ]; then
+        echo "FAIL: tools/django-seed/db.sqlite3 was created — django-rustyhip did not route to rustyhip" >&2
+        exit 1
+    fi
+    echo ""
+    echo "PASS: django-rustyhip → rustyhip → turbolite wrote $n objects to s3://{{BUCKET}}/{{DB_NAME}}/. No local sqlite file."
+
 # ---- Lambda (cargo-lambda) ----
 # Install once:  cargo binstall cargo-lambda  (or cargo install cargo-lambda)
 
