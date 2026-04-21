@@ -166,6 +166,30 @@ verify-django-rustyhip BUCKET="rustyhip-dev" DB_NAME="rustyhip":
     echo ""
     echo "PASS: django-rustyhip → rustyhip → turbolite wrote $n objects to s3://{{BUCKET}}/{{DB_NAME}}/. No local sqlite file."
 
+# ---- Load testing ----
+# Drives a mixed read/write workload against a rustyhip deployment and records
+# latency percentiles + QPS. Baseline for the RCE=1 saturation trigger tracked
+# in github.com/monkut/rustyhip/issues/1. Works against both `just rustyhip-dev`
+# (default) and a deployed API Gateway URL.
+#
+# Example — local floci:
+#   just loadtest
+# Example — deployed Lambda:
+#   just loadtest URL=https://xyz.execute-api.ap-northeast-1.amazonaws.com \
+#                 TOKEN=$RUSTYHIP_AUTH_TOKEN DURATION_S=60 CONCURRENCY=8
+loadtest URL="http://localhost:9000" TOKEN="" DURATION_S="30" CONCURRENCY="4" WRITE_RATIO="0.5":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p data
+    ts=$(date -u +%Y%m%d-%H%M%S)
+    out="data/loadtest-${ts}.json"
+    args=(--url {{URL}} --duration-s {{DURATION_S}} --concurrency {{CONCURRENCY}} --write-ratio {{WRITE_RATIO}} --output "$out")
+    if [ -n "{{TOKEN}}" ]; then
+        args+=(--token {{TOKEN}})
+    fi
+    uv run scripts/loadtest_rustyhip.py "${args[@]}"
+    echo "Report: $out"
+
 # ---- Lambda (cargo-lambda) ----
 # Install once:  cargo binstall cargo-lambda  (or cargo install cargo-lambda)
 
