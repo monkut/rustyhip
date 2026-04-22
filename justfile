@@ -166,6 +166,19 @@ verify-django-rustyhip BUCKET="rustyhip-dev" DB_NAME="rustyhip":
     echo ""
     echo "PASS: django-rustyhip → rustyhip → turbolite wrote $n objects to s3://{{BUCKET}}/{{DB_NAME}}/. No local sqlite file."
 
+# ---- CAS integration test ----
+# Proves two concurrent turbolite writers against the same floci prefix can't
+# both silently commit — the second's checkpoint fails with the CAS
+# precondition error (handle.rs::sync → commit_manifest). Requires floci up.
+cas-test BUCKET="rustyhip-cas-test":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    curl -sf http://localhost:4566/ >/dev/null 2>&1 || just floci-up
+    just floci-seed {{BUCKET}} >/dev/null
+    export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
+    export AWS_ENDPOINT_URL=http://localhost:4566
+    cargo test --test cas_conflict -- --ignored --nocapture
+
 # ---- Load testing ----
 # Drives a mixed read/write workload against a rustyhip deployment and records
 # latency percentiles + QPS. Baseline for the RCE=1 saturation trigger tracked
