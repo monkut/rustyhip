@@ -23,26 +23,21 @@
 //!
 //! ## How to actually verify the guarantee
 //!
-//! Three options:
+//! 1. **SDK-layer mock (landed, fastest).** The turbolite fork carries
+//!    `StaticReplayClient`-based unit tests that feed canned 412 / 200
+//!    responses to `PutObject` and assert the error surfaces as
+//!    `ManifestCasError::PreconditionFailed`. See
+//!    `turbolite/src/tiered/test_s3_client.rs`. Zero network, deterministic,
+//!    covers the SDK wiring fully. Does **not** exercise the full
+//!    two-writer-racing-over-a-real-network path.
 //!
-//! 1. **Real S3** (authoritative). Run against the `internaldevelopment`
-//!    AWS account with real credentials; point `AWS_ENDPOINT_URL` at a
-//!    real S3 URL (or unset it) and use a real bucket. Costs pennies.
+//! 2. **Real S3 (authoritative).** This test exists to be run that way.
+//!    Point `AWS_ENDPOINT_URL` at a real S3 URL (or unset it), use a real
+//!    bucket, real credentials. Costs pennies. Proves the end-to-end
+//!    guarantee holds when two genuinely separate writers race.
 //!
-//! 2. **`MinIO`** (free, local). `MinIO` has added `If-Match` support in
-//!    recent releases. Swap floci for `MinIO` in `docker-compose.yml` and
-//!    re-run.
-//!
-//! 3. **AWS SDK unit mock** (cheapest). Stub `PutObject` at the SDK layer
-//!    to return `412 Precondition Failed` when `If-Match` is present, and
-//!    assert the error surfaces through `commit_manifest` as
-//!    `ManifestCasError::PreconditionFailed`. Does not exercise the full
-//!    stack but proves the wiring.
-//!
-//! Until one of those is wired up, this test serves as infrastructure —
-//! it runs the full code path end-to-end and would fire correctly on real
-//! S3. On floci it is expected to FAIL with the "CAS didn't fire" panic;
-//! that failure is diagnostic, not a regression.
+//! On floci the probe at the top of the test detects missing `If-Match`
+//! support and skips with a clear diagnostic — no spurious failure.
 //!
 //! ## Known separate limitation
 //!
