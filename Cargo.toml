@@ -32,7 +32,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.35" }
-turbolite = { version = "0.4", git = "https://github.com/monkut/turbolite", rev = "337bc65800ae509fa05954a8ec2522813dbb1be7", features = ["zstd", "tiered", "bundled-sqlite"] }
+turbolite = { version = "0.4", git = "https://github.com/monkut/turbolite", rev = "537c84c397f80ff2d96d41afafd564b32d1f0167", features = ["zstd", "tiered", "bundled-sqlite"] }
 
 [dev-dependencies]
 tempfile = "3"
