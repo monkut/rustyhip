@@ -76,7 +76,11 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # Turbolite isn't published on crates.io yet (Rust lib + SQLite VFS, Apache-2.0);
 # pull from GitHub until they publish. `sqlite-vfs` is a sibling fork turbolite
 # depends on. Both pinned by Cargo.lock.
+# `monkut/turbolite` is our fork carrying the If-Match CAS work for issue #1
+# (see commits 21084c2, 57ba502, 072d0c6). Drop it back to upstream
+# russellromney once the CAS changes merge there.
 allow-git = [
   "https://github.com/russellromney/turbolite",
   "https://github.com/russellromney/sqlite-vfs.git",
+  "https://github.com/monkut/turbolite",
 ]
