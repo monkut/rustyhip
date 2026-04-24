@@ -166,6 +166,43 @@ verify-django-rustyhip BUCKET="rustyhip-dev" DB_NAME="rustyhip":
     echo ""
     echo "PASS: django-rustyhip → rustyhip → turbolite wrote $n objects to s3://{{BUCKET}}/{{DB_NAME}}/. No local sqlite file."
 
+# ---- CAS integration test ----
+# Proves two concurrent turbolite writers against the same floci prefix can't
+# both silently commit — the second's checkpoint fails with the CAS
+# precondition error (handle.rs::sync → commit_manifest). Requires floci up.
+cas-test BUCKET="rustyhip-cas-test":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    curl -sf http://localhost:4566/ >/dev/null 2>&1 || just floci-up
+    just floci-seed {{BUCKET}} >/dev/null
+    export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
+    export AWS_ENDPOINT_URL=http://localhost:4566
+    cargo test --test cas_conflict -- --ignored --nocapture
+
+# ---- Load testing ----
+# Drives a mixed read/write workload against a rustyhip deployment and records
+# latency percentiles + QPS. Baseline for the RCE=1 saturation trigger tracked
+# in github.com/monkut/rustyhip/issues/1. Works against both `just rustyhip-dev`
+# (default) and a deployed API Gateway URL.
+#
+# Example — local floci:
+#   just loadtest
+# Example — deployed Lambda:
+#   just loadtest URL=https://xyz.execute-api.ap-northeast-1.amazonaws.com \
+#                 TOKEN=$RUSTYHIP_AUTH_TOKEN DURATION_S=60 CONCURRENCY=8
+loadtest URL="http://localhost:9000" TOKEN="" DURATION_S="30" CONCURRENCY="4" WRITE_RATIO="0.5":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p data
+    ts=$(date -u +%Y%m%d-%H%M%S)
+    out="data/loadtest-${ts}.json"
+    args=(--url {{URL}} --duration-s {{DURATION_S}} --concurrency {{CONCURRENCY}} --write-ratio {{WRITE_RATIO}} --output "$out")
+    if [ -n "{{TOKEN}}" ]; then
+        args+=(--token {{TOKEN}})
+    fi
+    uv run scripts/loadtest_rustyhip.py "${args[@]}"
+    echo "Report: $out"
+
 # ---- Lambda (cargo-lambda) ----
 # Install once:  cargo binstall cargo-lambda  (or cargo install cargo-lambda)
 
@@ -188,12 +225,26 @@ template-gen *FLAGS:
     uv run scripts/generate_template.py --output template.yaml {{FLAGS}}
 
 # Deploy via SAM (requires `sam` CLI + AWS creds + Bucket/DbName/AuthToken overrides).
-template-deploy STACK="rhp-rustyhip" BUCKET="" DB_NAME="" AUTH_TOKEN="":
-    sam deploy --template-file template.yaml \
-        --stack-name {{STACK}} \
-        --capabilities CAPABILITY_IAM \
-        --resolve-s3 \
+# TAGS is passed verbatim to `sam deploy --tags` — space-separated Key=Value
+# pairs attached to the CloudFormation stack itself (child resources carry
+# their own tags from template.yaml). Empty by default; caller supplies any
+# key/value, e.g.
+#   just template-deploy ... TAGS="CmBillingGroup=ProjectId=<uuid>"
+#   just template-deploy ... TAGS="Env=prod Team=platform"
+template-deploy STACK="rhp-rustyhip" BUCKET="" DB_NAME="" AUTH_TOKEN="" TAGS="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=(
+        --template-file template.yaml
+        --stack-name {{STACK}}
+        --capabilities CAPABILITY_IAM
+        --resolve-s3
         --parameter-overrides BucketName={{BUCKET}} DbName={{DB_NAME}} AuthToken={{AUTH_TOKEN}}
+    )
+    if [ -n "{{TAGS}}" ]; then
+        args+=(--tags {{TAGS}})
+    fi
+    sam deploy "${args[@]}"
 
 # ---- AWS helpers ----
 create-project-bucket:

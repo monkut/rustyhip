@@ -35,13 +35,19 @@ from typing import Any
 
 import yaml
 
-# Classmethod billing tag — identifies which project the resource belongs to.
-DEFAULT_PROJECT_ID = "2daec5cf-78b5-4cdc-96be-06b7cefb6eb1"
-CM_BILLING_GROUP_TAG = "CmBillingGroup"
 
+def parse_tag(raw: str) -> tuple[str, str]:
+    """Parse a `Key=Value` CLI arg into a (key, value) pair.
 
-def build_tags(project_id: str) -> dict[str, str]:
-    return {CM_BILLING_GROUP_TAG: f"ProjectId={project_id}"}
+    Only the first `=` is the separator, so tag values may themselves
+    contain `=` (e.g. `CmBillingGroup=ProjectId=<uuid>`).
+    """
+    if "=" not in raw:
+        raise argparse.ArgumentTypeError(f"tag must be KEY=VALUE, got: {raw!r}")
+    key, value = raw.split("=", 1)
+    if not key:
+        raise argparse.ArgumentTypeError(f"tag key is empty in: {raw!r}")
+    return key, value
 
 
 def build_template(
@@ -57,9 +63,51 @@ def build_template(
     code_uri: str,
     handler: str,
     log_level: str,
-    project_id: str,
+    tags: dict[str, str],
 ) -> dict[str, Any]:
-    # build_tags() per call so each resource emits its own inline block (no YAML anchors).
+    api_properties: dict[str, Any] = {
+        "Name": api_name,
+        "StageName": "$default",
+    }
+    function_properties: dict[str, Any] = {
+        "FunctionName": function_name,
+        "CodeUri": code_uri,
+        "Handler": handler,
+        "Runtime": runtime,
+        "Architectures": [architecture],
+        "MemorySize": memory_mb,
+        "Timeout": timeout_s,
+        # rustyhip serializes writes through /tmp/rustyhip.db + S3 PutObject.
+        # Running more than one container at a time would race the upload (last-writer-wins)
+        # and let stale /tmp state serve reads that miss another container's writes.
+        "ReservedConcurrentExecutions": 1,
+        "Environment": {
+            "Variables": {
+                "BUCKET": {"Ref": "BucketName"},
+                "DB_NAME": {"Ref": "DbName"},
+                "RUSTYHIP_AUTH_TOKEN": {"Ref": "AuthToken"},
+                "LOG_LEVEL": log_level,
+            },
+        },
+        # Turbolite reads + writes many page objects under the DbName prefix.
+        "Policies": [
+            {"S3CrudPolicy": {"BucketName": {"Ref": "BucketName"}}},
+        ],
+        "Events": {
+            "Root": {
+                "Type": "HttpApi",
+                "Properties": {"ApiId": {"Ref": api_logical_id}, "Path": "/", "Method": "ANY"},
+            },
+            "Proxy": {
+                "Type": "HttpApi",
+                "Properties": {"ApiId": {"Ref": api_logical_id}, "Path": "/{proxy+}", "Method": "ANY"},
+            },
+        },
+    }
+    if tags:
+        # Fresh dict per resource so each emits its own inline block (no YAML anchors).
+        api_properties["Tags"] = dict(tags)
+        function_properties["Tags"] = dict(tags)
     return {
         "AWSTemplateFormatVersion": "2010-09-09",
         "Transform": "AWS::Serverless-2016-10-31",
@@ -89,50 +137,11 @@ def build_template(
         "Resources": {
             api_logical_id: {
                 "Type": "AWS::Serverless::HttpApi",
-                "Properties": {
-                    "Name": api_name,
-                    "StageName": "$default",
-                    "Tags": build_tags(project_id),
-                },
+                "Properties": api_properties,
             },
             function_logical_id: {
                 "Type": "AWS::Serverless::Function",
-                "Properties": {
-                    "FunctionName": function_name,
-                    "CodeUri": code_uri,
-                    "Handler": handler,
-                    "Runtime": runtime,
-                    "Architectures": [architecture],
-                    "MemorySize": memory_mb,
-                    "Timeout": timeout_s,
-                    # rustyhip serializes writes through /tmp/rustyhip.db + S3 PutObject.
-                    # Running more than one container at a time would race the upload (last-writer-wins)
-                    # and let stale /tmp state serve reads that miss another container's writes.
-                    "ReservedConcurrentExecutions": 1,
-                    "Environment": {
-                        "Variables": {
-                            "BUCKET": {"Ref": "BucketName"},
-                            "DB_NAME": {"Ref": "DbName"},
-                            "RUSTYHIP_AUTH_TOKEN": {"Ref": "AuthToken"},
-                            "LOG_LEVEL": log_level,
-                        },
-                    },
-                    # Turbolite reads + writes many page objects under the DbName prefix.
-                    "Policies": [
-                        {"S3CrudPolicy": {"BucketName": {"Ref": "BucketName"}}},
-                    ],
-                    "Events": {
-                        "Root": {
-                            "Type": "HttpApi",
-                            "Properties": {"ApiId": {"Ref": api_logical_id}, "Path": "/", "Method": "ANY"},
-                        },
-                        "Proxy": {
-                            "Type": "HttpApi",
-                            "Properties": {"ApiId": {"Ref": api_logical_id}, "Path": "/{proxy+}", "Method": "ANY"},
-                        },
-                    },
-                    "Tags": build_tags(project_id),
-                },
+                "Properties": function_properties,
             },
         },
         "Outputs": {
@@ -172,9 +181,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--handler", default="bootstrap", help="Lambda handler identifier (ignored for provided.* but required by schema).")
     p.add_argument("--log-level", default="info")
     p.add_argument(
-        "--project-id",
-        default=DEFAULT_PROJECT_ID,
-        help=f"Classmethod project UUID emitted as {CM_BILLING_GROUP_TAG}=ProjectId=<uuid> on every resource.",
+        "--tag",
+        action="append",
+        type=parse_tag,
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Tag to attach to every resource that supports Tags (repeatable). "
+            'Value may itself contain "=", e.g. --tag CmBillingGroup=ProjectId=<uuid>. '
+            "If omitted, resources emit no Tags block."
+        ),
     )
     p.add_argument("-o", "--output", type=Path, default=None, help="Write template to this path (default: stdout).")
     return p.parse_args(argv)
@@ -182,6 +198,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    tags = dict(args.tag)
     template = build_template(
         function_logical_id=args.function_logical_id,
         function_name=args.function_name,
@@ -194,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         code_uri=args.code_uri,
         handler=args.handler,
         log_level=args.log_level,
-        project_id=args.project_id,
+        tags=tags,
     )
     rendered = yaml.safe_dump(template, sort_keys=False, default_flow_style=False, width=120, allow_unicode=True)
     if args.output is None:
