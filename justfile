@@ -225,12 +225,26 @@ template-gen *FLAGS:
     uv run scripts/generate_template.py --output template.yaml {{FLAGS}}
 
 # Deploy via SAM (requires `sam` CLI + AWS creds + Bucket/DbName/AuthToken overrides).
-template-deploy STACK="rhp-rustyhip" BUCKET="" DB_NAME="" AUTH_TOKEN="":
-    sam deploy --template-file template.yaml \
-        --stack-name {{STACK}} \
-        --capabilities CAPABILITY_IAM \
-        --resolve-s3 \
+# TAGS is passed verbatim to `sam deploy --tags` — space-separated Key=Value
+# pairs attached to the CloudFormation stack itself (child resources carry
+# their own tags from template.yaml). Empty by default; caller supplies any
+# key/value, e.g.
+#   just template-deploy ... TAGS="CmBillingGroup=ProjectId=<uuid>"
+#   just template-deploy ... TAGS="Env=prod Team=platform"
+template-deploy STACK="rhp-rustyhip" BUCKET="" DB_NAME="" AUTH_TOKEN="" TAGS="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=(
+        --template-file template.yaml
+        --stack-name {{STACK}}
+        --capabilities CAPABILITY_IAM
+        --resolve-s3
         --parameter-overrides BucketName={{BUCKET}} DbName={{DB_NAME}} AuthToken={{AUTH_TOKEN}}
+    )
+    if [ -n "{{TAGS}}" ]; then
+        args+=(--tags {{TAGS}})
+    fi
+    sam deploy "${args[@]}"
 
 # ---- AWS helpers ----
 create-project-bucket:
