@@ -1,4 +1,36 @@
-This project uses the lambda rust runtime to provide sqlite-like DB access over s3
+This project uses the lambda rust runtime to provide sqlite-like DB access over s3.
+
+## Architecture: Lambda ephemeral compute
+
+rustyhip runs on AWS Lambda. Two facts shape every design decision:
+
+1. **`/tmp` is OK as in-invocation scratch.** turbolite's local page cache and
+   SQLite's WAL file live there during an invocation. Reading and writing /tmp
+   inside a single `/sql` call is fine.
+2. **`/tmp` is never canonical and never shared.** Each Lambda container has its
+   own /tmp. Other containers cannot see it. Eviction destroys it without
+   notice.
+
+**S3 is the source of truth.** Anything that must survive container eviction
+OR be visible to another concurrent container MUST land in S3. For the `/sql`
+endpoint specifically, the canonical write must land in S3 *before the response
+returns* — otherwise the client receives an ack for a write that may evaporate.
+
+Concrete consequences for design and review:
+
+- `src/handler.rs:152-169` runs `PRAGMA wal_checkpoint(TRUNCATE)` after every
+  non-readonly /sql call. This forces canonical state to S3 before responding.
+  Any replacement must be equally synchronous-to-S3.
+- Reject designs that rely on background tasks, timer-based async flushes,
+  warm-cache-survives-eviction assumptions, or "the next interval will ship
+  it" semantics for *durability* or *cross-container visibility*. Such
+  mechanisms are unsafe under eviction and cannot share state across
+  concurrent containers. They are acceptable only as best-effort optimizations
+  *on top of* synchronous-to-S3 commits.
+- Multi-writer concurrency (issue #1) is built on S3 conditional PUTs (CAS on
+  the manifest, via the monkut/turbolite fork), not local-WAL replication.
+- Issue #6 (turbolite `wal` feature) was closed for this reason — see the
+  issue thread for the full rationale.
 
 ## AWS Development Target
 
