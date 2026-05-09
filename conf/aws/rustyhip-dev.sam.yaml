@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: RustyHip — SQLite-over-S3 Lambda fronted by API Gateway HTTP API
+Parameters:
+  BucketName:
+    Type: String
+    Description: S3 bucket holding the turbolite-managed database pages.
+    AllowedPattern: ^[a-z0-9.\-]{3,63}$
+  DbName:
+    Type: String
+    Description: Turbolite prefix (logical database name) within the bucket.
+    MinLength: 1
+  AuthToken:
+    Type: String
+    NoEcho: true
+    Description: 'Bearer token that every /sql and /health request must present as `Authorization: Bearer <token>`. Required
+      — the handler refuses to serve anonymous traffic in any deployed environment.'
+    MinLength: 16
+Resources:
+  RustyHipHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: rhp-rustyhip-api
+      StageName: $default
+      Tags:
+        Project: kippo
+        Environment: dev
+  RustyHipFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: rhp-rustyhip
+      CodeUri: ./target/lambda/rustyhip
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+      - arm64
+      MemorySize: 512
+      Timeout: 30
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          BUCKET:
+            Ref: BucketName
+          DB_NAME:
+            Ref: DbName
+          RUSTYHIP_AUTH_TOKEN:
+            Ref: AuthToken
+          LOG_LEVEL: info
+      Policies:
+      - S3CrudPolicy:
+          BucketName:
+            Ref: BucketName
+      Events:
+        Root:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: RustyHipHttpApi
+            Path: /
+            Method: ANY
+        Proxy:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: RustyHipHttpApi
+            Path: /{proxy+}
+            Method: ANY
+      Tags:
+        Project: kippo
+        Environment: dev
+Outputs:
+  ApiEndpoint:
+    Description: Invoke URL for the default HttpApi stage.
+    Value:
+      Fn::Sub: https://${RustyHipHttpApi}.execute-api.${AWS::Region}.amazonaws.com/
+  ApiName:
+    Description: HttpApi physical name.
+    Value: rhp-rustyhip-api
+  FunctionName:
+    Description: Lambda function name.
+    Value:
+      Ref: RustyHipFunction
+  FunctionArn:
+    Description: Lambda function ARN.
+    Value:
+      Fn::GetAtt:
+      - RustyHipFunction
+      - Arn

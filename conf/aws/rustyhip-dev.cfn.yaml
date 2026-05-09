@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  RustyHip dev deployment — Lambda (arm64) + API Gateway HTTP API.
+  Plain CloudFormation (no SAM transform) for agent-compatible deployment.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: rustyhip-dev-db
+    Description: S3 bucket for turbolite database pages.
+
+  DbName:
+    Type: String
+    Default: kippo
+    Description: Turbolite prefix (logical database name) within the bucket.
+
+  AuthToken:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: Bearer token required on every /sql and /health request.
+
+  CodeBucket:
+    Type: String
+    Description: S3 bucket holding the Lambda deployment zip.
+
+  CodeKey:
+    Type: String
+    Description: S3 key of the Lambda deployment zip.
+
+Resources:
+
+  RustyHipLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/rhp-rustyhip-dev
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: kippo
+        - Key: Environment
+          Value: dev
+
+  RustyHipExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: rhp-rustyhip-dev-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3DbAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:HeadObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${BucketName}"
+                  - !Sub "arn:aws:s3:::${BucketName}/*"
+      Tags:
+        - Key: Project
+          Value: kippo
+        - Key: Environment
+          Value: dev
+
+  RustyHipFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RustyHipLogGroup
+    Properties:
+      FunctionName: rhp-rustyhip-dev
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      Handler: bootstrap
+      Role: !GetAtt RustyHipExecutionRole.Arn
+      MemorySize: 512
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+      Environment:
+        Variables:
+          BUCKET: !Ref BucketName
+          DB_NAME: !Ref DbName
+          AUTH_TOKEN: !Ref AuthToken
+          LOG_LEVEL: info
+          ENVIRONMENT: dev
+      Tags:
+        - Key: Project
+          Value: kippo
+        - Key: Environment
+          Value: dev
+
+  RustyHipHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: rhp-rustyhip-dev-api
+      ProtocolType: HTTP
+      Tags:
+        Project: kippo
+        Environment: dev
+
+  RustyHipIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RustyHipHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RustyHipFunction.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  RustyHipDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RustyHipHttpApi
+      RouteKey: "$default"
+      Target: !Sub "integrations/${RustyHipIntegration}"
+
+  RustyHipStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref RustyHipHttpApi
+      StageName: "$default"
+      AutoDeploy: true
+      Tags:
+        Project: kippo
+        Environment: dev
+
+  RustyHipLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RustyHipFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RustyHipHttpApi}/*/*"
+
+Outputs:
+  ApiEndpoint:
+    Description: Invoke URL for the rustyhip HTTP API.
+    Value: !Sub "https://${RustyHipHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+    Export:
+      Name: rustyhip-dev-api-endpoint
+
+  FunctionName:
+    Description: Lambda function name.
+    Value: !Ref RustyHipFunction
+
+  FunctionArn:
+    Description: Lambda function ARN.
+    Value: !GetAtt RustyHipFunction.Arn
