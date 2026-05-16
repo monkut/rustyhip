@@ -7,7 +7,8 @@
 use std::path::PathBuf;
 use std::sync::Once;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 use crate::logging::JsonEventFormatter;
@@ -43,6 +44,36 @@ pub const ENV_AUTH_TOKEN: &str = "RUSTYHIP_AUTH_TOKEN";
 pub const ENV_AWS_ENDPOINT_URL: &str = "AWS_ENDPOINT_URL";
 /// Per-service override for the S3 endpoint URL.
 pub const ENV_AWS_ENDPOINT_URL_S3: &str = "AWS_ENDPOINT_URL_S3";
+
+// --- DB / SQLite pragmas (P0) — applied once at connection open. Unset = SQLite default. ---
+/// `PRAGMA synchronous` — `full` (default) / `normal` / `off` / `extra`.
+pub const ENV_SYNCHRONOUS: &str = "RUSTYHIP_SYNCHRONOUS";
+/// `PRAGMA journal_mode` — `delete` / `wal` / `memory` / `off` / `truncate` / `persist`.
+pub const ENV_JOURNAL_MODE: &str = "RUSTYHIP_JOURNAL_MODE";
+/// `PRAGMA cache_size` in **KB** (negative-form to `SQLite`, so we negate before applying).
+pub const ENV_PAGE_CACHE_KB: &str = "RUSTYHIP_PAGE_CACHE_KB";
+/// `PRAGMA mmap_size` in bytes.
+pub const ENV_MMAP_SIZE: &str = "RUSTYHIP_MMAP_SIZE";
+/// `PRAGMA temp_store` — `default` / `file` / `memory`.
+pub const ENV_TEMP_STORE: &str = "RUSTYHIP_TEMP_STORE";
+/// `PRAGMA busy_timeout` in ms.
+pub const ENV_BUSY_TIMEOUT_MS: &str = "RUSTYHIP_BUSY_TIMEOUT_MS";
+
+// --- Request-shaping knobs (P0/P1) ---
+/// Hard cap on rows returned per `/sql` call. `0` or unset = no cap.
+pub const ENV_MAX_ROWS: &str = "RUSTYHIP_MAX_ROWS";
+/// Per-statement wall-clock timeout in ms. Unset = no timeout.
+pub const ENV_QUERY_TIMEOUT_MS: &str = "RUSTYHIP_QUERY_TIMEOUT_MS";
+/// Max request body size in bytes. Unset = no cap (Lambda enforces its own 6 MB ceiling).
+pub const ENV_MAX_BODY_BYTES: &str = "RUSTYHIP_MAX_BODY_BYTES";
+
+// --- Durability knob (P1) ---
+/// Post-write checkpoint mode.
+///
+/// Values: `truncate` (default) / `restart` / `full` / `passive` / `off`.
+/// **Lambda durability requires `truncate`.** Override only in single-tenant
+/// container deployments where you understand the trade-off (see `CLAUDE.md`).
+pub const ENV_CHECKPOINT_MODE: &str = "RUSTYHIP_CHECKPOINT_MODE";
 
 /// Default deployment environment when `ENVIRONMENT` is unset.
 pub const DEFAULT_ENVIRONMENT: &str = "development";
@@ -96,6 +127,194 @@ pub fn use_path_style_s3() -> bool {
 #[must_use]
 pub fn auth_token() -> Option<String> {
     std::env::var(ENV_AUTH_TOKEN).ok().filter(|s| !s.is_empty())
+}
+
+/// `PRAGMA synchronous` setting. `SQLite` default is `Full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Synchronous {
+    Off,
+    Normal,
+    Full,
+    Extra,
+}
+
+impl Synchronous {
+    #[must_use]
+    pub const fn as_pragma(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Normal => "NORMAL",
+            Self::Full => "FULL",
+            Self::Extra => "EXTRA",
+        }
+    }
+}
+
+/// `PRAGMA journal_mode` setting. `SQLite` default is `Delete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalMode {
+    Delete,
+    Truncate,
+    Persist,
+    Memory,
+    Wal,
+    Off,
+}
+
+impl JournalMode {
+    #[must_use]
+    pub const fn as_pragma(self) -> &'static str {
+        match self {
+            Self::Delete => "DELETE",
+            Self::Truncate => "TRUNCATE",
+            Self::Persist => "PERSIST",
+            Self::Memory => "MEMORY",
+            Self::Wal => "WAL",
+            Self::Off => "OFF",
+        }
+    }
+}
+
+/// `PRAGMA temp_store` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TempStore {
+    Default,
+    File,
+    Memory,
+}
+
+impl TempStore {
+    #[must_use]
+    pub const fn as_pragma(self) -> &'static str {
+        match self {
+            Self::Default => "DEFAULT",
+            Self::File => "FILE",
+            Self::Memory => "MEMORY",
+        }
+    }
+}
+
+/// Post-write checkpoint mode. `Truncate` is required for Lambda durability —
+/// any other value trades durability or visibility for throughput.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointMode {
+    #[default]
+    Truncate,
+    Restart,
+    Full,
+    Passive,
+    Off,
+}
+
+impl CheckpointMode {
+    /// SQL fragment to splice into `PRAGMA wal_checkpoint(<here>)`. `Off` returns
+    /// `None` — callers should skip the checkpoint entirely instead of executing.
+    #[must_use]
+    pub const fn as_pragma_arg(self) -> Option<&'static str> {
+        match self {
+            Self::Truncate => Some("TRUNCATE"),
+            Self::Restart => Some("RESTART"),
+            Self::Full => Some("FULL"),
+            Self::Passive => Some("PASSIVE"),
+            Self::Off => None,
+        }
+    }
+}
+
+/// Parsed config knobs read once at bootstrap. `None` = honor SQLite/handler default.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigKnobs {
+    pub synchronous: Option<Synchronous>,
+    pub journal_mode: Option<JournalMode>,
+    pub page_cache_kb: Option<i64>,
+    pub mmap_size: Option<i64>,
+    pub temp_store: Option<TempStore>,
+    pub busy_timeout_ms: Option<u32>,
+    pub max_rows: Option<usize>,
+    pub query_timeout_ms: Option<u64>,
+    pub max_body_bytes: Option<usize>,
+    pub checkpoint_mode: CheckpointMode,
+}
+
+/// Read all P0/P1 knobs from the environment. Bad values log a warning and fall
+/// back to the unset behavior rather than failing bootstrap — a typo in
+/// `RUSTYHIP_SYNCHRONOUS` shouldn't take production down.
+#[must_use]
+pub fn config_knobs() -> ConfigKnobs {
+    ConfigKnobs {
+        synchronous: parse_env(ENV_SYNCHRONOUS, parse_synchronous),
+        journal_mode: parse_env(ENV_JOURNAL_MODE, parse_journal_mode),
+        page_cache_kb: parse_env(ENV_PAGE_CACHE_KB, |s| s.parse::<i64>().map_err(|e| anyhow!("{e}"))),
+        mmap_size: parse_env(ENV_MMAP_SIZE, |s| s.parse::<i64>().map_err(|e| anyhow!("{e}"))),
+        temp_store: parse_env(ENV_TEMP_STORE, parse_temp_store),
+        busy_timeout_ms: parse_env(ENV_BUSY_TIMEOUT_MS, |s| s.parse::<u32>().map_err(|e| anyhow!("{e}"))),
+        max_rows: parse_env(ENV_MAX_ROWS, |s| s.parse::<usize>().map_err(|e| anyhow!("{e}")))
+            .and_then(|n| if n == 0 { None } else { Some(n) }),
+        query_timeout_ms: parse_env(ENV_QUERY_TIMEOUT_MS, |s| s.parse::<u64>().map_err(|e| anyhow!("{e}"))).and_then(
+            |n| {
+                if n == 0 { None } else { Some(n) }
+            },
+        ),
+        max_body_bytes: parse_env(ENV_MAX_BODY_BYTES, |s| s.parse::<usize>().map_err(|e| anyhow!("{e}"))).and_then(
+            |n| {
+                if n == 0 { None } else { Some(n) }
+            },
+        ),
+        checkpoint_mode: parse_env(ENV_CHECKPOINT_MODE, parse_checkpoint_mode).unwrap_or_default(),
+    }
+}
+
+fn parse_env<T>(key: &str, parser: fn(&str) -> Result<T>) -> Option<T> {
+    let raw = std::env::var(key).ok().filter(|s| !s.is_empty())?;
+    match parser(raw.trim()) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(env = key, value = %raw, error = %e, "invalid env value — falling back to default");
+            None
+        }
+    }
+}
+
+fn parse_synchronous(s: &str) -> Result<Synchronous> {
+    match s.to_ascii_lowercase().as_str() {
+        "off" | "0" => Ok(Synchronous::Off),
+        "normal" | "1" => Ok(Synchronous::Normal),
+        "full" | "2" => Ok(Synchronous::Full),
+        "extra" | "3" => Ok(Synchronous::Extra),
+        other => Err(anyhow!("unknown synchronous mode '{other}'")),
+    }
+}
+
+fn parse_journal_mode(s: &str) -> Result<JournalMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "delete" => Ok(JournalMode::Delete),
+        "truncate" => Ok(JournalMode::Truncate),
+        "persist" => Ok(JournalMode::Persist),
+        "memory" => Ok(JournalMode::Memory),
+        "wal" => Ok(JournalMode::Wal),
+        "off" => Ok(JournalMode::Off),
+        other => Err(anyhow!("unknown journal mode '{other}'")),
+    }
+}
+
+fn parse_temp_store(s: &str) -> Result<TempStore> {
+    match s.to_ascii_lowercase().as_str() {
+        "default" | "0" => Ok(TempStore::Default),
+        "file" | "1" => Ok(TempStore::File),
+        "memory" | "2" | "mem" => Ok(TempStore::Memory),
+        other => Err(anyhow!("unknown temp_store '{other}'")),
+    }
+}
+
+fn parse_checkpoint_mode(s: &str) -> Result<CheckpointMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "truncate" => Ok(CheckpointMode::Truncate),
+        "restart" => Ok(CheckpointMode::Restart),
+        "full" => Ok(CheckpointMode::Full),
+        "passive" => Ok(CheckpointMode::Passive),
+        "off" | "skip" | "none" => Ok(CheckpointMode::Off),
+        other => Err(anyhow!("unknown checkpoint mode '{other}'")),
+    }
 }
 
 /// Initialize tracing. Idempotent — safe to call from both `lib` and `bin`.
