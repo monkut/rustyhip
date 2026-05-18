@@ -203,6 +203,12 @@ loadtest URL="http://localhost:9000" TOKEN="" DURATION_S="30" CONCURRENCY="4" WR
     uv run scripts/loadtest_rustyhip.py "${args[@]}"
     echo "Report: $out"
 
+# Local micro-benchmarks against the real handler + default SQLite VFS (no S3).
+# Writes results/{VERSION}-benchmark-results.jsonl + results/benchmarks.md.
+# See results/benchmarks.md for what is and isn't measured.
+bench:
+    cargo run --release --example bench
+
 # ---- Lambda (cargo-lambda) ----
 # Install once:  cargo binstall cargo-lambda  (or cargo install cargo-lambda)
 
