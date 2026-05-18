@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 use crate::VERSION;
 use crate::errors;
 use crate::logging::elapsed_ms;
+use crate::settings::CheckpointMode;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +125,17 @@ fn check_auth(state: &AppState, req: &Request, request_id: &str) -> Result<(), R
 
 async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response<Body>, Error> {
     let bytes: &[u8] = body.as_ref();
+    if let Some(max) = state.max_body_bytes
+        && bytes.len() > max
+    {
+        warn!(body_bytes = bytes.len(), max, %request_id, "request body exceeded RUSTYHIP_MAX_BODY_BYTES");
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            errors::VALIDATION,
+            format!("request body of {} bytes exceeds RUSTYHIP_MAX_BODY_BYTES={max}", bytes.len()),
+            request_id,
+        );
+    }
     let req: SqlRequest = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -149,9 +161,16 @@ async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response
             // a container eviction between writes and checkpoint would silently drop
             // data. Force a checkpoint after every non-readonly call — sync_mode=Durable
             // (turbolite default) blocks it until the S3 manifest+pages land.
-            if !outcome.readonly {
-                if let Err(e) = state.db.exec("PRAGMA wal_checkpoint(TRUNCATE)".to_owned(), vec![]).await {
-                    error!(error = ?e, "post-write checkpoint failed — write may not be durable in S3");
+            //
+            // The mode is configurable via RUSTYHIP_CHECKPOINT_MODE; Lambda must
+            // keep the default `Truncate` (see CLAUDE.md / state.rs).
+            if !outcome.readonly
+                && state.checkpoint_mode != CheckpointMode::Off
+                && let Some(arg) = state.checkpoint_mode.as_pragma_arg()
+            {
+                let sql = format!("PRAGMA wal_checkpoint({arg})");
+                if let Err(e) = state.db.exec(sql, vec![]).await {
+                    error!(error = ?e, mode = ?state.checkpoint_mode, "post-write checkpoint failed — write may not be durable in S3");
                     info!(
                         op = "handle_sql",
                         phase = "end",
@@ -322,5 +341,39 @@ mod tests {
         let body = parse_body(&resp);
         assert_eq!(body["readonly"], true);
         assert_eq!(body["rows"][0]["x"], 1);
+    }
+
+    #[tokio::test]
+    async fn body_exceeding_max_returns_413() {
+        let (_dir, state) = make_state(None);
+        let state = Arc::new((*state).clone().with_max_body_bytes(Some(16)));
+        let resp =
+            handle(state, make_request("POST", "/sql", r#"{"sql":"SELECT 1 AS one"}"#, None)).await.expect("handler");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = parse_body(&resp);
+        assert_eq!(body["error"]["code"], errors::VALIDATION);
+        assert!(body["error"]["message"].as_str().unwrap().contains("RUSTYHIP_MAX_BODY_BYTES=16"));
+    }
+
+    #[tokio::test]
+    async fn body_within_max_passes_through() {
+        let (_dir, state) = make_state(None);
+        let state = Arc::new((*state).clone().with_max_body_bytes(Some(1024)));
+        let resp =
+            handle(state, make_request("POST", "/sql", r#"{"sql":"SELECT 1 AS one"}"#, None)).await.expect("handler");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_mode_off_skips_pragma_call() {
+        let (_dir, state) = make_state(None);
+        let state = Arc::new((*state).clone().with_checkpoint_mode(CheckpointMode::Off));
+        // A non-readonly write should succeed with no checkpoint attempted.
+        let resp = handle(state.clone(), make_request("POST", "/sql", r#"{"sql":"CREATE TABLE t (x INTEGER)"}"#, None))
+            .await
+            .expect("handler");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = parse_body(&resp);
+        assert_eq!(body["readonly"], false);
     }
 }

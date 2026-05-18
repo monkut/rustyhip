@@ -14,9 +14,11 @@ use std::time::Instant;
 
 use anyhow::Context;
 use lambda_http::{Error, run, service_fn};
+use rustyhip::db::{DbSettings, SqliteDb};
 use rustyhip::logging::elapsed_ms;
+use rustyhip::settings::CheckpointMode;
 use rustyhip::state::AppState;
-use rustyhip::{VERSION, db::SqliteDb, handler, settings};
+use rustyhip::{VERSION, handler, settings};
 use tracing::{info, warn};
 use turbolite::tiered::{TurboliteConfig, TurboliteVfs, register};
 
@@ -57,8 +59,34 @@ async fn main() -> Result<(), Error> {
     let vfs = TurboliteVfs::new(config).context("build turbolite VFS")?;
     register(VFS_NAME, vfs).context("register turbolite VFS")?;
 
+    let knobs = settings::config_knobs();
+    info!(
+        op = "bootstrap",
+        synchronous = ?knobs.synchronous,
+        journal_mode = ?knobs.journal_mode,
+        page_cache_kb = ?knobs.page_cache_kb,
+        mmap_size = ?knobs.mmap_size,
+        temp_store = ?knobs.temp_store,
+        busy_timeout_ms = ?knobs.busy_timeout_ms,
+        max_rows = ?knobs.max_rows,
+        query_timeout_ms = ?knobs.query_timeout_ms,
+        max_body_bytes = ?knobs.max_body_bytes,
+        checkpoint_mode = ?knobs.checkpoint_mode,
+        "resolved config knobs",
+    );
+    if knobs.checkpoint_mode != CheckpointMode::Truncate {
+        warn!(
+            mode = ?knobs.checkpoint_mode,
+            "RUSTYHIP_CHECKPOINT_MODE != truncate — writes may not be durable across container eviction. \
+             This is unsafe on AWS Lambda. See CLAUDE.md.",
+        );
+    }
+
     let db_path = cache_dir.join("rustyhip.db");
-    let db = Arc::new(SqliteDb::open_with_vfs(db_path, VFS_NAME).context("open db via turbolite VFS")?);
+    let db = Arc::new(
+        SqliteDb::open_with(db_path, Some(VFS_NAME), DbSettings::from_knobs(&knobs))
+            .context("open db via turbolite VFS")?,
+    );
 
     let auth_token = settings::auth_token();
     if auth_token.is_none() {
@@ -67,7 +95,11 @@ async fn main() -> Result<(), Error> {
              Set the env var before exposing this Lambda outside local dev."
         );
     }
-    let state = Arc::new(AppState::new(db, auth_token));
+    let state = Arc::new(
+        AppState::new(db, auth_token)
+            .with_max_body_bytes(knobs.max_body_bytes)
+            .with_checkpoint_mode(knobs.checkpoint_mode),
+    );
 
     info!(op = "bootstrap", phase = "end", duration_ms = elapsed_ms(started), "END bootstrap");
 
