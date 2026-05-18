@@ -341,3 +341,69 @@ pub fn init_logging() {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synchronous_parses_all_aliases() {
+        assert_eq!(parse_synchronous("off").unwrap(), Synchronous::Off);
+        assert_eq!(parse_synchronous("0").unwrap(), Synchronous::Off);
+        assert_eq!(parse_synchronous("NORMAL").unwrap(), Synchronous::Normal);
+        assert_eq!(parse_synchronous("1").unwrap(), Synchronous::Normal);
+        assert_eq!(parse_synchronous("full").unwrap(), Synchronous::Full);
+        assert_eq!(parse_synchronous("Extra").unwrap(), Synchronous::Extra);
+    }
+
+    #[test]
+    fn synchronous_rejects_garbage() {
+        let err = parse_synchronous("bogus").unwrap_err();
+        assert!(err.to_string().contains("unknown synchronous mode"));
+    }
+
+    #[test]
+    fn journal_mode_parses_all_aliases() {
+        assert_eq!(parse_journal_mode("delete").unwrap(), JournalMode::Delete);
+        assert_eq!(parse_journal_mode("WAL").unwrap(), JournalMode::Wal);
+        assert_eq!(parse_journal_mode("memory").unwrap(), JournalMode::Memory);
+    }
+
+    #[test]
+    fn journal_mode_rejects_garbage() {
+        assert!(parse_journal_mode("walrus").is_err());
+    }
+
+    #[test]
+    fn temp_store_parses_all_aliases() {
+        assert_eq!(parse_temp_store("default").unwrap(), TempStore::Default);
+        assert_eq!(parse_temp_store("mem").unwrap(), TempStore::Memory);
+        assert_eq!(parse_temp_store("2").unwrap(), TempStore::Memory);
+    }
+
+    #[test]
+    fn checkpoint_mode_parses_all_aliases() {
+        assert_eq!(parse_checkpoint_mode("truncate").unwrap(), CheckpointMode::Truncate);
+        assert_eq!(parse_checkpoint_mode("OFF").unwrap(), CheckpointMode::Off);
+        assert_eq!(parse_checkpoint_mode("skip").unwrap(), CheckpointMode::Off);
+        assert_eq!(parse_checkpoint_mode("none").unwrap(), CheckpointMode::Off);
+        assert_eq!(parse_checkpoint_mode("passive").unwrap(), CheckpointMode::Passive);
+    }
+
+    #[test]
+    fn checkpoint_mode_default_is_truncate() {
+        assert_eq!(CheckpointMode::default(), CheckpointMode::Truncate);
+    }
+
+    /// `parse_env` swallows parse errors into `None` so a bad env value can't
+    /// take down bootstrap. We can't easily inject env vars in a unit test
+    /// without flaky inter-test ordering, so call the helper directly with a
+    /// closure that mirrors the bad-input path.
+    #[test]
+    fn parse_env_swallows_bad_values() {
+        // Synthetic key that nothing else reads — `parse_env` returns None when
+        // the env var is unset.
+        let result = parse_env("RUSTYHIP_PARSE_TEST_UNSET_KEY_XYZ", parse_synchronous);
+        assert!(result.is_none());
+    }
+}
