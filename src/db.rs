@@ -105,9 +105,12 @@ pub struct ExecOutcome {
     pub columns: Vec<String>,
     /// Result rows keyed by column name (empty for non-`SELECT`).
     pub rows: Vec<Value>,
-    /// Rows changed by the statement (0 for `SELECT` / DDL).
+    /// Rows changed by the statement. Always 0 for read-only statements
+    /// (`SELECT`, read-form pragmas); 0 for DDL.
     pub rowcount: i64,
-    /// `last_insert_rowid` after the statement (0 when no `INSERT` has occurred in this connection).
+    /// `last_insert_rowid` after a write statement (0 for read-only
+    /// statements; for non-`INSERT` writes it carries the connection's most
+    /// recent `INSERT` rowid).
     pub lastrowid: i64,
     /// `true` when the statement produced no schema/data changes (e.g. `SELECT`, read-only pragma).
     pub readonly: bool,
@@ -374,8 +377,12 @@ fn run_exec(conn: &Connection, sql: &str, params: Vec<Value>, max_rows: Option<u
     drop(rows_iter);
     drop(stmt);
 
-    let rowcount = i64::try_from(conn.changes()).unwrap_or(i64::MAX);
-    let lastrowid = conn.last_insert_rowid();
+    // sqlite3_changes / last_insert_rowid are connection-scoped and NOT reset
+    // by read-only statements — reading them here for a SELECT would leak the
+    // counters of a previous, unrelated request on this shared connection
+    // (monkut/rustyhip#20). Report 0 for read-only statements instead.
+    let (rowcount, lastrowid) =
+        if readonly { (0, 0) } else { (i64::try_from(conn.changes()).unwrap_or(i64::MAX), conn.last_insert_rowid()) };
     Ok(ExecOutcome { columns, rows, rowcount, lastrowid, readonly })
 }
 
@@ -506,6 +513,20 @@ mod tests {
             .expect("select");
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.rows[0]["name"], "peach");
+    }
+
+    /// Regression for monkut/rustyhip#20: a SELECT after an INSERT on the same
+    /// (shared, long-lived) connection must not report the INSERT's counters.
+    #[tokio::test]
+    async fn select_does_not_leak_previous_write_counters() {
+        let (_f, db) = empty_db();
+        exec_sql(&db, "CREATE TABLE fruit (id INTEGER PRIMARY KEY, name TEXT)").await;
+        let write = exec_sql(&db, "INSERT INTO fruit (name) VALUES ('apple'), ('peach')").await;
+        assert_eq!(write.rowcount, 2);
+        assert_eq!(write.lastrowid, 2);
+        let read = exec_sql(&db, "SELECT name FROM fruit").await;
+        assert_eq!(read.rowcount, 0, "SELECT must report rowcount 0");
+        assert_eq!(read.lastrowid, 0, "SELECT must report lastrowid 0");
     }
 
     #[tokio::test]
