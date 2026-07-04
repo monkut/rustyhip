@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::{debug, info};
 
@@ -98,12 +98,28 @@ pub struct SqliteDb {
     settings: DbSettings,
 }
 
+/// Shape of each element of [`ExecOutcome::rows`], selected per request via
+/// the `rows_format` body field (monkut/rustyhip#23).
+///
+/// `Objects` (default, backward-compatible) repeats every column name in every
+/// row; `Arrays` emits each row as a plain value array aligned with
+/// [`ExecOutcome::columns`], cutting both serialization work and payload size
+/// for large results.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RowsFormat {
+    #[default]
+    Objects,
+    Arrays,
+}
+
 /// Result of executing a single SQL statement.
 #[derive(Debug, Serialize)]
 pub struct ExecOutcome {
     /// Column names in declaration order (empty for non-`SELECT`).
     pub columns: Vec<String>,
-    /// Result rows keyed by column name (empty for non-`SELECT`).
+    /// Result rows (empty for non-`SELECT`): objects keyed by column name, or
+    /// value arrays aligned with `columns` — see [`RowsFormat`].
     pub rows: Vec<Value>,
     /// Rows changed by the statement. Always 0 for read-only statements
     /// (`SELECT`, read-form pragmas); 0 for DDL.
@@ -162,7 +178,7 @@ impl SqliteDb {
     /// No durability checkpoint — tests and local tooling only. Production
     /// callers use [`Self::exec_durable`].
     pub async fn exec(&self, sql: String, params: Vec<Value>) -> Result<ExecOutcome> {
-        self.exec_durable(sql, params, CheckpointMode::Off).await.map_err(|e| match e {
+        self.exec_durable(sql, params, RowsFormat::Objects, CheckpointMode::Off).await.map_err(|e| match e {
             ExecError::Sql(e) | ExecError::Checkpoint(e) | ExecError::Internal(e) => e,
         })
     }
@@ -187,6 +203,7 @@ impl SqliteDb {
         &self,
         sql: String,
         params: Vec<Value>,
+        rows_format: RowsFormat,
         mode: CheckpointMode,
     ) -> Result<ExecOutcome, ExecError> {
         let started = Instant::now();
@@ -199,7 +216,8 @@ impl SqliteDb {
         let result: Result<ExecOutcome, ExecError> = tokio::task::spawn_blocking(move || {
             let guard = conn.lock().map_err(|e| ExecError::Internal(anyhow!("connection mutex poisoned: {e}")))?;
             let was_in_txn = !guard.is_autocommit();
-            let outcome = run_exec_with_settings(&guard, &sql, params, &settings).map_err(ExecError::Sql)?;
+            let outcome =
+                run_exec_with_settings(&guard, &sql, params, rows_format, &settings).map_err(ExecError::Sql)?;
             let needs_checkpoint = guard.is_autocommit() && (!outcome.readonly || was_in_txn);
             if needs_checkpoint && let Some(arg) = mode.as_pragma_arg() {
                 let stats = run_checkpoint(&guard, arg).map_err(ExecError::Checkpoint)?;
@@ -317,6 +335,7 @@ fn run_exec_with_settings(
     conn: &Connection,
     sql: &str,
     params: Vec<Value>,
+    rows_format: RowsFormat,
     settings: &DbSettings,
 ) -> Result<ExecOutcome> {
     let timeout_installed = settings.query_timeout_ms.is_some();
@@ -326,7 +345,7 @@ fn run_exec_with_settings(
         // without measurably moving the floor (see results/benchmarks.md).
         conn.progress_handler(10_000, Some(move || Instant::now() > deadline));
     }
-    let result = run_exec(conn, sql, params, settings.max_rows);
+    let result = run_exec(conn, sql, params, settings.max_rows, rows_format);
     if timeout_installed {
         conn.progress_handler::<fn() -> bool>(0, None);
     }
@@ -351,7 +370,13 @@ fn error_is_interrupt(e: &anyhow::Error) -> bool {
     })
 }
 
-fn run_exec(conn: &Connection, sql: &str, params: Vec<Value>, max_rows: Option<usize>) -> Result<ExecOutcome> {
+fn run_exec(
+    conn: &Connection,
+    sql: &str,
+    params: Vec<Value>,
+    max_rows: Option<usize>,
+    rows_format: RowsFormat,
+) -> Result<ExecOutcome> {
     let bind_params: Vec<SqlValue> = params.into_iter().map(json_to_sql).collect::<Result<_>>()?;
 
     let mut stmt = conn.prepare(sql).context("prepare statement")?;
@@ -367,12 +392,25 @@ fn run_exec(conn: &Connection, sql: &str, params: Vec<Value>, max_rows: Option<u
         {
             return Err(anyhow!("result exceeded RUSTYHIP_MAX_ROWS={cap}; refusing to materialize more rows"));
         }
-        let mut obj = Map::with_capacity(col_count);
-        for (i, name) in columns.iter().enumerate() {
-            let raw: SqlValue = row.get(i).with_context(|| format!("read column {i}"))?;
-            obj.insert(name.clone(), sql_to_json(raw));
-        }
-        rows.push(Value::Object(obj));
+        let value = match rows_format {
+            RowsFormat::Objects => {
+                let mut obj = Map::with_capacity(col_count);
+                for (i, name) in columns.iter().enumerate() {
+                    let raw: SqlValue = row.get(i).with_context(|| format!("read column {i}"))?;
+                    obj.insert(name.clone(), sql_to_json(raw));
+                }
+                Value::Object(obj)
+            }
+            RowsFormat::Arrays => {
+                let mut arr = Vec::with_capacity(col_count);
+                for i in 0..col_count {
+                    let raw: SqlValue = row.get(i).with_context(|| format!("read column {i}"))?;
+                    arr.push(sql_to_json(raw));
+                }
+                Value::Array(arr)
+            }
+        };
+        rows.push(value);
     }
     drop(rows_iter);
     drop(stmt);
@@ -530,6 +568,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rows_format_arrays_aligns_with_columns() {
+        let (_f, db) = empty_db();
+        exec_sql(&db, "CREATE TABLE fruit (id INTEGER PRIMARY KEY, name TEXT)").await;
+        exec_sql(&db, "INSERT INTO fruit (name) VALUES ('apple'), ('peach')").await;
+        let out = db
+            .exec_durable(
+                "SELECT id, name FROM fruit ORDER BY id".into(),
+                vec![],
+                RowsFormat::Arrays,
+                CheckpointMode::Off,
+            )
+            .await
+            .expect("select");
+        assert_eq!(out.columns, vec!["id".to_owned(), "name".to_owned()]);
+        assert_eq!(out.rows[0], serde_json::json!([1, "apple"]));
+        assert_eq!(out.rows[1], serde_json::json!([2, "peach"]));
+    }
+
+    #[tokio::test]
     async fn missing_table_returns_error() {
         let (_f, db) = empty_db();
         let err = db.exec("SELECT * FROM does_not_exist".into(), vec![]).await.expect_err("should fail");
@@ -592,7 +649,9 @@ mod tests {
     #[tokio::test]
     async fn plain_write_checkpoint_truncates_wal() {
         let (_f, db) = wal_mode_db();
-        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], CheckpointMode::Truncate).await.expect("create");
+        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
+            .await
+            .expect("create");
         assert_eq!(wal_size(db.path()), 0, "wal should be truncated after a checkpointed write");
     }
 
@@ -604,7 +663,9 @@ mod tests {
         let before = wal_size(db.path());
         assert!(before > 0, "un-checkpointed write should leave WAL frames");
         // …then a readonly SELECT with checkpointing enabled must not flush them.
-        db.exec_durable("SELECT * FROM t".into(), vec![], CheckpointMode::Truncate).await.expect("select");
+        db.exec_durable("SELECT * FROM t".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
+            .await
+            .expect("select");
         assert_eq!(wal_size(db.path()), before, "readonly statement must not checkpoint");
     }
 
@@ -614,12 +675,14 @@ mod tests {
     #[tokio::test]
     async fn commit_of_explicit_transaction_is_checkpointed() {
         let (_f, db) = wal_mode_db();
-        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], CheckpointMode::Truncate).await.expect("create");
-        db.exec_durable("BEGIN".into(), vec![], CheckpointMode::Truncate).await.expect("begin");
-        db.exec_durable("INSERT INTO t VALUES (1)".into(), vec![], CheckpointMode::Truncate)
+        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
+            .await
+            .expect("create");
+        db.exec_durable("BEGIN".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate).await.expect("begin");
+        db.exec_durable("INSERT INTO t VALUES (1)".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
             .await
             .expect("insert in txn");
-        db.exec_durable("COMMIT".into(), vec![], CheckpointMode::Truncate).await.expect("commit");
+        db.exec_durable("COMMIT".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate).await.expect("commit");
         assert_eq!(wal_size(db.path()), 0, "COMMIT must flush the transaction out of the WAL");
         let out = db.exec("SELECT x FROM t".into(), vec![]).await.expect("select");
         assert_eq!(out.rows.len(), 1);
@@ -631,13 +694,15 @@ mod tests {
     #[tokio::test]
     async fn blocked_checkpoint_surfaces_as_checkpoint_error() {
         let (file, db) = wal_mode_db();
-        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], CheckpointMode::Truncate).await.expect("create");
+        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
+            .await
+            .expect("create");
         // Second connection holds an open read snapshot, preventing WAL reset.
         let reader = Connection::open(file.path()).expect("open reader");
         reader.execute_batch("BEGIN").expect("begin read txn");
         let _count: i64 = reader.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).expect("acquire read snapshot");
         let err = db
-            .exec_durable("INSERT INTO t VALUES (1)".into(), vec![], CheckpointMode::Truncate)
+            .exec_durable("INSERT INTO t VALUES (1)".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
             .await
             .expect_err("checkpoint should report busy");
         assert!(matches!(err, ExecError::Checkpoint(_)), "unexpected error variant: {err:?}");
@@ -677,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn internal_checkpoint_still_works_with_authorizer() {
         let (_f, db) = wal_mode_db();
-        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], CheckpointMode::Truncate)
+        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
             .await
             .expect("checkpointed write with authorizer installed");
         assert_eq!(wal_size(db.path()), 0);

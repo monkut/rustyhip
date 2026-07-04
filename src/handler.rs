@@ -3,7 +3,7 @@
 //! Wire format:
 //!   `GET  /`        → health
 //!   `GET  /health`  → health
-//!   `POST /sql`     → `{"sql": "...", "params": [...]?}`
+//!   `POST /sql`     → `{"sql": "...", "params": [...]?, "rows_format": "objects"|"arrays"?}`
 //!                   → `{"columns": [...], "rows": [...], "rowcount": N, "lastrowid": M, "readonly": bool}`
 //!
 //! Auth: when `RUSTYHIP_AUTH_TOKEN` is set, every request (including `/health`)
@@ -25,7 +25,7 @@ use subtle::ConstantTimeEq;
 use tracing::{debug, error, info, warn};
 
 use crate::VERSION;
-use crate::db::ExecError;
+use crate::db::{ExecError, RowsFormat};
 use crate::errors;
 use crate::logging::elapsed_ms;
 use crate::state::AppState;
@@ -35,6 +35,10 @@ pub struct SqlRequest {
     pub sql: String,
     #[serde(default)]
     pub params: Vec<serde_json::Value>,
+    /// Row shape: `"objects"` (default) or `"arrays"` (rows aligned with
+    /// `columns` — smaller payloads for large results). See [`RowsFormat`].
+    #[serde(default)]
+    pub rows_format: RowsFormat,
 }
 
 #[derive(Debug, Serialize)]
@@ -175,7 +179,11 @@ async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response
     // pushes canonical state to S3 before the ack) lives in the DB layer —
     // see `SqliteDb::exec_durable`. The handler only maps outcomes to HTTP.
     // Row/column detail for the END event is already logged by `db_exec`.
-    let (outcome_label, resp) = match state.db.exec_durable(req.sql, req.params, state.checkpoint_mode).await {
+    let (outcome_label, resp) = match state
+        .db
+        .exec_durable(req.sql, req.params, req.rows_format, state.checkpoint_mode)
+        .await
+    {
         Ok(outcome) => ("ok", json_response(StatusCode::OK, &outcome)),
         Err(ExecError::Sql(e)) => {
             error!(error = ?e, "sql exec failed");
@@ -354,6 +362,34 @@ mod tests {
         let body = parse_body(&resp);
         assert_eq!(body["readonly"], true);
         assert_eq!(body["rows"][0]["x"], 1);
+    }
+
+    #[tokio::test]
+    async fn rows_format_arrays_returns_value_arrays() {
+        let (_dir, state) = make_state(None);
+        state.db.exec("CREATE TABLE t (a INT, b TEXT)".into(), vec![]).await.expect("create");
+        state.db.exec("INSERT INTO t VALUES (1, 'x'), (2, 'y')".into(), vec![]).await.expect("insert");
+        let resp = handle(
+            state,
+            make_request("POST", "/sql", r#"{"sql":"SELECT a, b FROM t ORDER BY a","rows_format":"arrays"}"#, None),
+        )
+        .await
+        .expect("handler");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = parse_body(&resp);
+        assert_eq!(body["columns"], serde_json::json!(["a", "b"]));
+        assert_eq!(body["rows"], serde_json::json!([[1, "x"], [2, "y"]]));
+    }
+
+    #[tokio::test]
+    async fn rows_format_invalid_returns_400() {
+        let (_dir, state) = make_state(None);
+        let resp = handle(state, make_request("POST", "/sql", r#"{"sql":"SELECT 1","rows_format":"tuples"}"#, None))
+            .await
+            .expect("handler");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = parse_body(&resp);
+        assert_eq!(body["error"]["code"], errors::VALIDATION);
     }
 
     #[tokio::test]
