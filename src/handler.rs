@@ -129,25 +129,36 @@ fn check_auth(state: &AppState, req: &Request, request_id: &str) -> Result<(), R
     Err(resp)
 }
 
-async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response<Body>, Error> {
+/// Parse + validate the `/sql` request body. `Err` carries the ready-made
+/// error response so `sql` can early-return it verbatim.
+#[allow(clippy::result_large_err)]
+fn parse_sql_request(
+    state: &AppState,
+    body: &Body,
+    request_id: &str,
+) -> Result<SqlRequest, Result<Response<Body>, Error>> {
     let bytes: &[u8] = body.as_ref();
     if let Some(max) = state.max_body_bytes
         && bytes.len() > max
     {
         warn!(body_bytes = bytes.len(), max, %request_id, "request body exceeded RUSTYHIP_MAX_BODY_BYTES");
-        return json_error(
+        return Err(json_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             errors::VALIDATION,
             format!("request body of {} bytes exceeds RUSTYHIP_MAX_BODY_BYTES={max}", bytes.len()),
             request_id,
-        );
+        ));
     }
-    let req: SqlRequest = match serde_json::from_slice(bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "invalid JSON request body");
-            return json_error(StatusCode::BAD_REQUEST, errors::VALIDATION, format!("invalid JSON: {e}"), request_id);
-        }
+    serde_json::from_slice(bytes).map_err(|e| {
+        warn!(error = %e, "invalid JSON request body");
+        json_error(StatusCode::BAD_REQUEST, errors::VALIDATION, format!("invalid JSON: {e}"), request_id)
+    })
+}
+
+async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response<Body>, Error> {
+    let req = match parse_sql_request(state, body, request_id) {
+        Ok(req) => req,
+        Err(resp) => return resp,
     };
     let started = Instant::now();
     info!(
@@ -163,37 +174,16 @@ async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response
     // Durability policy (when/how to run the post-write wal_checkpoint that
     // pushes canonical state to S3 before the ack) lives in the DB layer —
     // see `SqliteDb::exec_durable`. The handler only maps outcomes to HTTP.
-    match state.db.exec_durable(req.sql, req.params, state.checkpoint_mode).await {
-        Ok(outcome) => {
-            let resp = json_response(StatusCode::OK, &outcome);
-            info!(
-                op = "handle_sql",
-                phase = "end",
-                duration_ms = elapsed_ms(started),
-                outcome = "ok",
-                readonly = outcome.readonly,
-                row_count = outcome.rows.len(),
-                rowcount = outcome.rowcount,
-                "END handle_sql"
-            );
-            resp
-        }
+    // Row/column detail for the END event is already logged by `db_exec`.
+    let (outcome_label, resp) = match state.db.exec_durable(req.sql, req.params, state.checkpoint_mode).await {
+        Ok(outcome) => ("ok", json_response(StatusCode::OK, &outcome)),
         Err(ExecError::Sql(e)) => {
             error!(error = ?e, "sql exec failed");
             // `{:#}` surfaces the full anyhow context chain (e.g. "prepare statement: no such table: foo").
-            let resp = json_error(StatusCode::BAD_REQUEST, errors::SQL, format!("{e:#}"), request_id);
-            info!(
-                op = "handle_sql",
-                phase = "end",
-                duration_ms = elapsed_ms(started),
-                outcome = "error",
-                "END handle_sql"
-            );
-            resp
+            ("error", json_error(StatusCode::BAD_REQUEST, errors::SQL, format!("{e:#}"), request_id))
         }
         Err(e @ (ExecError::Checkpoint(_) | ExecError::Internal(_))) => {
-            let outcome_label =
-                if matches!(e, ExecError::Checkpoint(_)) { "checkpoint_error" } else { "internal_error" };
+            let label = if matches!(e, ExecError::Checkpoint(_)) { "checkpoint_error" } else { "internal_error" };
             error!(error = %e, mode = ?state.checkpoint_mode, "durable exec failed — write may not be durable in S3");
             let resp = json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -201,16 +191,17 @@ async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response
                 format!("durable exec failed: {e}"),
                 request_id,
             );
-            info!(
-                op = "handle_sql",
-                phase = "end",
-                duration_ms = elapsed_ms(started),
-                outcome = outcome_label,
-                "END handle_sql"
-            );
-            resp
+            (label, resp)
         }
-    }
+    };
+    info!(
+        op = "handle_sql",
+        phase = "end",
+        duration_ms = elapsed_ms(started),
+        outcome = outcome_label,
+        "END handle_sql"
+    );
+    resp
 }
 
 fn json_response<T: Serialize>(status: StatusCode, payload: &T) -> Result<Response<Body>, Error> {
