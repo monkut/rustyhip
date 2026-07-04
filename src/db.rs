@@ -19,7 +19,40 @@ use serde_json::{Map, Value};
 use tracing::{debug, info};
 
 use crate::logging::elapsed_ms;
-use crate::settings::{ConfigKnobs, JournalMode, Synchronous, TempStore};
+use crate::settings::{CheckpointMode, ConfigKnobs, JournalMode, Synchronous, TempStore};
+
+/// Failure modes of [`SqliteDb::exec_durable`], split so the HTTP layer can map
+/// them to distinct status codes without string-matching.
+#[derive(Debug)]
+pub enum ExecError {
+    /// Statement preparation/execution failed — a client error (bad SQL,
+    /// missing table, parameter mismatch, …).
+    Sql(anyhow::Error),
+    /// The statement succeeded but the durability checkpoint did not complete —
+    /// the write may not have reached S3 and must not be acked.
+    Checkpoint(anyhow::Error),
+    /// Worker/runtime failure (blocking task panicked or was cancelled).
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for ExecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `{:#}` surfaces the full anyhow context chain in one line.
+        let (Self::Sql(e) | Self::Checkpoint(e) | Self::Internal(e)) = self;
+        write!(f, "{e:#}")
+    }
+}
+
+impl std::error::Error for ExecError {}
+
+/// Result row of `PRAGMA wal_checkpoint(...)`: `(busy, log, checkpointed)`.
+/// `busy != 0` means the checkpoint could not run to completion.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointStats {
+    pub busy: i64,
+    pub log: i64,
+    pub checkpointed: i64,
+}
 
 /// Subset of [`ConfigKnobs`] consumed by the DB layer. Cloned into [`SqliteDb`]
 /// so per-request callers don't re-read env.
@@ -117,7 +150,36 @@ impl SqliteDb {
     }
 
     /// Run `sql` (optionally with `params`) and return rows + change metadata.
+    /// No durability checkpoint — tests and local tooling only. Production
+    /// callers use [`Self::exec_durable`].
     pub async fn exec(&self, sql: String, params: Vec<Value>) -> Result<ExecOutcome> {
+        self.exec_durable(sql, params, CheckpointMode::Off).await.map_err(|e| match e {
+            ExecError::Sql(e) | ExecError::Checkpoint(e) | ExecError::Internal(e) => e,
+        })
+    }
+
+    /// Run `sql`, then — when the statement leaves durable work in the WAL —
+    /// run `PRAGMA wal_checkpoint(<mode>)` **in the same blocking task, under
+    /// the same connection lock**, so the canonical state lands in S3 (via the
+    /// turbolite VFS) before the caller acks. See `CLAUDE.md`.
+    ///
+    /// Checkpoint gating: `sqlite3_stmt_readonly` reports transaction-control
+    /// statements (`BEGIN`/`COMMIT`/`ROLLBACK`/…) as read-only, so the readonly
+    /// flag alone would skip the flush of a committed transaction. Instead we
+    /// checkpoint when the connection is in autocommit after the statement AND
+    /// (the statement wrote, OR it just closed an explicit transaction).
+    /// Statements *inside* an open transaction are never checkpointed —
+    /// uncommitted frames cannot be flushed, and until `COMMIT` returns the
+    /// client holds no durability promise for them.
+    ///
+    /// A checkpoint that reports `busy != 0` did not flush everything and is
+    /// surfaced as [`ExecError::Checkpoint`] — callers must not ack the write.
+    pub async fn exec_durable(
+        &self,
+        sql: String,
+        params: Vec<Value>,
+        mode: CheckpointMode,
+    ) -> Result<ExecOutcome, ExecError> {
         let started = Instant::now();
         let sql_bytes = sql.len();
         let param_count = params.len();
@@ -125,12 +187,35 @@ impl SqliteDb {
 
         let conn = self.conn.clone();
         let settings = self.settings.clone();
-        let result: Result<ExecOutcome> = tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().map_err(|e| anyhow!("connection mutex poisoned: {e}"))?;
-            run_exec_with_settings(&guard, &sql, params, &settings)
+        let result: Result<ExecOutcome, ExecError> = tokio::task::spawn_blocking(move || {
+            let guard = conn.lock().map_err(|e| ExecError::Internal(anyhow!("connection mutex poisoned: {e}")))?;
+            let was_in_txn = !guard.is_autocommit();
+            let outcome = run_exec_with_settings(&guard, &sql, params, &settings).map_err(ExecError::Sql)?;
+            let needs_checkpoint = guard.is_autocommit() && (!outcome.readonly || was_in_txn);
+            if needs_checkpoint && let Some(arg) = mode.as_pragma_arg() {
+                let stats = run_checkpoint(&guard, arg).map_err(ExecError::Checkpoint)?;
+                info!(
+                    op = "db_checkpoint",
+                    mode = arg,
+                    busy = stats.busy,
+                    log = stats.log,
+                    checkpointed = stats.checkpointed,
+                    "post-write wal_checkpoint"
+                );
+                if stats.busy != 0 {
+                    return Err(ExecError::Checkpoint(anyhow!(
+                        "wal_checkpoint({arg}) could not complete (busy={}, log={}, checkpointed={})",
+                        stats.busy,
+                        stats.log,
+                        stats.checkpointed
+                    )));
+                }
+            }
+            drop(guard);
+            Ok(outcome)
         })
         .await
-        .context("sqlite worker panicked")?;
+        .map_err(|e| ExecError::Internal(anyhow!("sqlite worker panicked: {e}")))?;
 
         match &result {
             Ok(o) => info!(
@@ -148,12 +233,23 @@ impl SqliteDb {
                 phase = "end",
                 duration_ms = elapsed_ms(started),
                 outcome = "error",
-                error = %format_args!("{e:#}"),
+                error = %e,
                 "END db_exec"
             ),
         }
         result
     }
+}
+
+/// Run `PRAGMA wal_checkpoint(<arg>)` through a lean path — no JSON row
+/// materialization — and return its `(busy, log, checkpointed)` result row.
+/// On a non-WAL database `SQLite` returns `(0, -1, -1)`, i.e. success.
+fn run_checkpoint(conn: &Connection, arg: &str) -> Result<CheckpointStats> {
+    let sql = format!("PRAGMA wal_checkpoint({arg})");
+    conn.query_row(&sql, [], |row| {
+        Ok(CheckpointStats { busy: row.get(0)?, log: row.get(1)?, checkpointed: row.get(2)? })
+    })
+    .with_context(|| format!("run {sql}"))
 }
 
 /// Wrap [`run_exec`] with timeout enforcement (`RUSTYHIP_QUERY_TIMEOUT_MS`) via
@@ -403,6 +499,74 @@ mod tests {
         db.exec("INSERT INTO t VALUES (1),(2),(3),(4)".into(), vec![]).await.expect("seed");
         let out = db.exec("SELECT id FROM t".into(), vec![]).await.expect("select");
         assert_eq!(out.rows.len(), 4);
+    }
+
+    /// WAL sidecar size in bytes (0 when the file doesn't exist yet).
+    fn wal_size(db_path: &Path) -> u64 {
+        let mut wal = db_path.as_os_str().to_owned();
+        wal.push("-wal");
+        std::fs::metadata(&wal).map_or(0, |m| m.len())
+    }
+
+    fn wal_mode_db() -> (NamedTempFile, SqliteDb) {
+        let file = NamedTempFile::new().expect("tempfile");
+        let settings = DbSettings { journal_mode: Some(JournalMode::Wal), ..DbSettings::default() };
+        let db = SqliteDb::open_with(file.path().to_owned(), None, settings).expect("open");
+        (file, db)
+    }
+
+    #[tokio::test]
+    async fn plain_write_checkpoint_truncates_wal() {
+        let (_f, db) = wal_mode_db();
+        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], CheckpointMode::Truncate).await.expect("create");
+        assert_eq!(wal_size(db.path()), 0, "wal should be truncated after a checkpointed write");
+    }
+
+    #[tokio::test]
+    async fn readonly_select_does_not_checkpoint() {
+        let (_f, db) = wal_mode_db();
+        // Write WITHOUT a checkpoint so frames stay in the WAL…
+        db.exec("CREATE TABLE t (x INTEGER)".into(), vec![]).await.expect("create");
+        let before = wal_size(db.path());
+        assert!(before > 0, "un-checkpointed write should leave WAL frames");
+        // …then a readonly SELECT with checkpointing enabled must not flush them.
+        db.exec_durable("SELECT * FROM t".into(), vec![], CheckpointMode::Truncate).await.expect("select");
+        assert_eq!(wal_size(db.path()), before, "readonly statement must not checkpoint");
+    }
+
+    /// Regression for monkut/rustyhip#17: `sqlite3_stmt_readonly` reports
+    /// COMMIT as readonly, so gating the checkpoint on the statement's readonly
+    /// flag alone would leave a committed transaction sitting in the local WAL.
+    #[tokio::test]
+    async fn commit_of_explicit_transaction_is_checkpointed() {
+        let (_f, db) = wal_mode_db();
+        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], CheckpointMode::Truncate).await.expect("create");
+        db.exec_durable("BEGIN".into(), vec![], CheckpointMode::Truncate).await.expect("begin");
+        db.exec_durable("INSERT INTO t VALUES (1)".into(), vec![], CheckpointMode::Truncate)
+            .await
+            .expect("insert in txn");
+        db.exec_durable("COMMIT".into(), vec![], CheckpointMode::Truncate).await.expect("commit");
+        assert_eq!(wal_size(db.path()), 0, "COMMIT must flush the transaction out of the WAL");
+        let out = db.exec("SELECT x FROM t".into(), vec![]).await.expect("select");
+        assert_eq!(out.rows.len(), 1);
+    }
+
+    /// A checkpoint that cannot complete (`busy != 0`) must fail the call —
+    /// acking a write whose frames are still local-only would violate the
+    /// durability contract (CLAUDE.md).
+    #[tokio::test]
+    async fn blocked_checkpoint_surfaces_as_checkpoint_error() {
+        let (file, db) = wal_mode_db();
+        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], CheckpointMode::Truncate).await.expect("create");
+        // Second connection holds an open read snapshot, preventing WAL reset.
+        let reader = Connection::open(file.path()).expect("open reader");
+        reader.execute_batch("BEGIN").expect("begin read txn");
+        let _count: i64 = reader.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).expect("acquire read snapshot");
+        let err = db
+            .exec_durable("INSERT INTO t VALUES (1)".into(), vec![], CheckpointMode::Truncate)
+            .await
+            .expect_err("checkpoint should report busy");
+        assert!(matches!(err, ExecError::Checkpoint(_)), "unexpected error variant: {err:?}");
     }
 
     #[tokio::test]

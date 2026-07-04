@@ -18,9 +18,16 @@ returns* — otherwise the client receives an ack for a write that may evaporate
 
 Concrete consequences for design and review:
 
-- `src/handler.rs:152-169` runs `PRAGMA wal_checkpoint(TRUNCATE)` after every
-  non-readonly /sql call. This forces canonical state to S3 before responding.
-  Any replacement must be equally synchronous-to-S3.
+- `SqliteDb::exec_durable` (`src/db.rs`) runs `PRAGMA wal_checkpoint(TRUNCATE)`
+  after every /sql call that leaves durable work in the WAL — including the
+  `COMMIT` of a client-driven explicit transaction (`sqlite3_stmt_readonly`
+  reports COMMIT as read-only, so gating on the statement's readonly flag alone
+  would skip it). A checkpoint reporting `busy != 0` fails the request instead
+  of acking. This forces canonical state to S3 before responding. Any
+  replacement must be equally synchronous-to-S3.
+- Statements *inside* an open explicit transaction are acked without a
+  checkpoint — uncommitted frames cannot be flushed, and no durability promise
+  exists until `COMMIT` returns 200.
 - Reject designs that rely on background tasks, timer-based async flushes,
   warm-cache-survives-eviction assumptions, or "the next interval will ship
   it" semantics for *durability* or *cross-container visibility*. Such

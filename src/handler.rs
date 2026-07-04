@@ -24,9 +24,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::VERSION;
+use crate::db::ExecError;
 use crate::errors;
 use crate::logging::elapsed_ms;
-use crate::settings::CheckpointMode;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -154,38 +154,11 @@ async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response
     );
     debug!(op = "handle_sql", sql = %req.sql, "sql text");
 
-    match state.db.exec(req.sql, req.params).await {
+    // Durability policy (when/how to run the post-write wal_checkpoint that
+    // pushes canonical state to S3 before the ack) lives in the DB layer —
+    // see `SqliteDb::exec_durable`. The handler only maps outcomes to HTTP.
+    match state.db.exec_durable(req.sql, req.params, state.checkpoint_mode).await {
         Ok(outcome) => {
-            // Writes live in turbolite's local WAL on /tmp until checkpoint; SQLite's
-            // default wal_autocheckpoint only fires every 1000 frames, so in a Lambda
-            // a container eviction between writes and checkpoint would silently drop
-            // data. Force a checkpoint after every non-readonly call — sync_mode=Durable
-            // (turbolite default) blocks it until the S3 manifest+pages land.
-            //
-            // The mode is configurable via RUSTYHIP_CHECKPOINT_MODE; Lambda must
-            // keep the default `Truncate` (see CLAUDE.md / state.rs).
-            if !outcome.readonly
-                && state.checkpoint_mode != CheckpointMode::Off
-                && let Some(arg) = state.checkpoint_mode.as_pragma_arg()
-            {
-                let sql = format!("PRAGMA wal_checkpoint({arg})");
-                if let Err(e) = state.db.exec(sql, vec![]).await {
-                    error!(error = ?e, mode = ?state.checkpoint_mode, "post-write checkpoint failed — write may not be durable in S3");
-                    info!(
-                        op = "handle_sql",
-                        phase = "end",
-                        duration_ms = elapsed_ms(started),
-                        outcome = "checkpoint_error",
-                        "END handle_sql"
-                    );
-                    return json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        errors::INTERNAL,
-                        format!("checkpoint failed: {e:#}"),
-                        request_id,
-                    );
-                }
-            }
             let resp = json_response(StatusCode::OK, &outcome);
             info!(
                 op = "handle_sql",
@@ -199,7 +172,7 @@ async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response
             );
             resp
         }
-        Err(e) => {
+        Err(ExecError::Sql(e)) => {
             error!(error = ?e, "sql exec failed");
             // `{:#}` surfaces the full anyhow context chain (e.g. "prepare statement: no such table: foo").
             let resp = json_error(StatusCode::BAD_REQUEST, errors::SQL, format!("{e:#}"), request_id);
@@ -208,6 +181,25 @@ async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response
                 phase = "end",
                 duration_ms = elapsed_ms(started),
                 outcome = "error",
+                "END handle_sql"
+            );
+            resp
+        }
+        Err(e @ (ExecError::Checkpoint(_) | ExecError::Internal(_))) => {
+            let outcome_label =
+                if matches!(e, ExecError::Checkpoint(_)) { "checkpoint_error" } else { "internal_error" };
+            error!(error = %e, mode = ?state.checkpoint_mode, "durable exec failed — write may not be durable in S3");
+            let resp = json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                errors::INTERNAL,
+                format!("durable exec failed: {e}"),
+                request_id,
+            );
+            info!(
+                op = "handle_sql",
+                phase = "end",
+                duration_ms = elapsed_ms(started),
+                outcome = outcome_label,
                 "END handle_sql"
             );
             resp
@@ -246,6 +238,7 @@ fn extract_request_id(req: &Request) -> String {
 mod tests {
     use super::*;
     use crate::db::SqliteDb;
+    use crate::settings::CheckpointMode;
     use lambda_http::http::Request as HttpRequest;
     use tempfile::TempDir;
 
@@ -362,6 +355,33 @@ mod tests {
         let resp =
             handle(state, make_request("POST", "/sql", r#"{"sql":"SELECT 1 AS one"}"#, None)).await.expect("handler");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// monkut/rustyhip#17: a client-driven BEGIN/INSERT/COMMIT across three
+    /// /sql calls must leave nothing in the local WAL after COMMIT is acked.
+    #[tokio::test]
+    async fn explicit_transaction_commit_is_checkpointed() {
+        use crate::db::DbSettings;
+        use crate::settings::JournalMode;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("rustyhip.db");
+        let settings = DbSettings { journal_mode: Some(JournalMode::Wal), ..DbSettings::default() };
+        let db = Arc::new(SqliteDb::open_with(db_path.clone(), None, settings).expect("open sqlite"));
+        let state = Arc::new(AppState::new(db, None)); // default CheckpointMode::Truncate
+
+        for sql in [
+            r#"{"sql":"CREATE TABLE t (x INTEGER)"}"#,
+            r#"{"sql":"BEGIN"}"#,
+            r#"{"sql":"INSERT INTO t VALUES (1)"}"#,
+            r#"{"sql":"COMMIT"}"#,
+        ] {
+            let resp = handle(state.clone(), make_request("POST", "/sql", sql, None)).await.expect("handler");
+            assert_eq!(resp.status(), StatusCode::OK, "failed on {sql}");
+        }
+        let wal = db_path.with_extension("db-wal");
+        let wal_len = std::fs::metadata(&wal).map_or(0, |m| m.len());
+        assert_eq!(wal_len, 0, "WAL must be empty after an acked COMMIT");
     }
 
     #[tokio::test]

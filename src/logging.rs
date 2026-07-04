@@ -4,21 +4,68 @@
 //!   `timestamp` (ISO 8601 UTC), `level`, `event`, `logger`, `service`, `environment`.
 //! Extra key/value fields from `tracing` macros are folded in alongside those.
 //!
+//! [`init_logging`] wires the subscriber: JSON structured output by default
+//! (production / Lambda), opt into human-readable text locally with
+//! `LOG_FORMAT=pretty`.
+//!
 //! Sensitive-field scrubber: any field whose name contains one of
 //! [`SENSITIVE_FIELD_NAMES`] (case-insensitive substring match) is replaced
 //! with `[REDACTED]` before serialization. This is a safety net — the primary
 //! rule is never to pass sensitive data to the logger in the first place.
 
 use std::fmt;
+use std::sync::Once;
 
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
+
+use crate::settings::{SERVICE_NAME, environment};
+
+static INIT: Once = Once::new();
+
+/// Default level used when `LOG_LEVEL` / `RUST_LOG` are unset.
+pub const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// Environment variable selecting the log output format (`json` | `pretty`). Defaults to `json`.
+pub const ENV_LOG_FORMAT: &str = "LOG_FORMAT";
+
+/// Log output format: `json` (structured) or `pretty` (human-readable). Case-insensitive.
+#[must_use]
+pub fn log_format() -> String {
+    std::env::var(ENV_LOG_FORMAT).unwrap_or_else(|_| "json".to_owned())
+}
+
+/// Initialize tracing. Idempotent — safe to call from both `lib` and `bin`.
+///
+/// Honors `RUST_LOG`; falls back to `LOG_LEVEL`; finally to [`DEFAULT_LOG_LEVEL`].
+/// Format is selected by [`log_format`]:
+/// - `json` (default) → structured one-line JSON per event, required fields per the sops logging spec
+/// - `pretty` / `text` / `human` → human-readable console output for local dev
+pub fn init_logging() {
+    INIT.call_once(|| {
+        let filter = EnvFilter::try_from_default_env()
+            .or_else(|_| {
+                let level = std::env::var("LOG_LEVEL").unwrap_or_else(|_| DEFAULT_LOG_LEVEL.to_owned());
+                EnvFilter::try_new(level)
+            })
+            .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_LEVEL));
+
+        let fmt = tracing_subscriber::fmt().with_env_filter(filter).with_target(true);
+        let format = log_format();
+        if matches!(format.to_ascii_lowercase().as_str(), "pretty" | "text" | "human") {
+            fmt.init();
+        } else {
+            fmt.event_format(JsonEventFormatter::new(SERVICE_NAME, environment())).init();
+        }
+    });
+}
 
 /// Field-name substrings that trigger value redaction. Case-insensitive.
 pub const SENSITIVE_FIELD_NAMES: &[&str] =

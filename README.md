@@ -211,6 +211,13 @@ levers if you can trade durability for throughput.
 |-----|---------|---------|
 | `RUSTYHIP_CHECKPOINT_MODE` | `truncate` | Post-write checkpoint mode: `truncate` / `restart` / `full` / `passive` / `off`. **`truncate` is the only Lambda-safe value.** Bootstrap logs a `warn!` when overridden. |
 
+The checkpoint runs for every `/sql` call that leaves durable work in the
+WAL — plain writes and the `COMMIT`/`ROLLBACK` that closes a client-driven
+explicit transaction. Statements *inside* an open transaction are acked
+without a checkpoint: no durability promise exists until `COMMIT` returns
+200. A checkpoint that cannot complete (`busy != 0`) fails the request
+with **500** `RUSTYHIP_E_INTERNAL` instead of acking a non-durable write.
+
 ### Turbolite (inherited, set independently of rustyhip)
 
 The turbolite VFS reads many of its own knobs from env directly. The

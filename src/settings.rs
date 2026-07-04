@@ -1,22 +1,12 @@
-//! Runtime configuration — environment variables and logging setup.
+//! Runtime configuration — environment variables parsed into typed knobs.
 //!
-//! Logging follows the weyucou/sops logging guidelines: JSON structured output
-//! by default (production / Lambda), opt into human-readable text locally with
-//! `LOG_FORMAT=pretty`. See [`crate::logging`] for the JSON formatter.
+//! Logging setup (subscriber init, output format selection) lives in
+//! [`crate::logging`].
 
 use std::path::PathBuf;
-use std::sync::Once;
 
 use anyhow::{Context, Result, anyhow};
 use tracing::warn;
-use tracing_subscriber::EnvFilter;
-
-use crate::logging::JsonEventFormatter;
-
-static INIT: Once = Once::new();
-
-/// Default level used when `LOG_LEVEL` / `RUST_LOG` are unset.
-pub const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// Default AWS region if neither `AWS_REGION` nor `REGION` is set.
 pub const DEFAULT_REGION: &str = "ap-northeast-1";
@@ -35,8 +25,6 @@ pub const ENV_DB_NAME: &str = "DB_NAME";
 pub const ENV_CACHE_DIR: &str = "DB_CACHE_DIR";
 /// Environment variable naming the deployment environment label (production / staging / development).
 pub const ENV_ENVIRONMENT: &str = "ENVIRONMENT";
-/// Environment variable selecting the log output format (`json` | `pretty`). Defaults to `json`.
-pub const ENV_LOG_FORMAT: &str = "LOG_FORMAT";
 /// Environment variable holding the bearer token every request must present.
 /// Unset / empty = auth disabled (local dev only; startup logs a warning).
 pub const ENV_AUTH_TOKEN: &str = "RUSTYHIP_AUTH_TOKEN";
@@ -105,12 +93,6 @@ pub fn cache_dir() -> PathBuf {
 #[must_use]
 pub fn environment() -> String {
     std::env::var(ENV_ENVIRONMENT).unwrap_or_else(|_| DEFAULT_ENVIRONMENT.to_owned())
-}
-
-/// Log output format: `json` (structured) or `pretty` (human-readable). Case-insensitive.
-#[must_use]
-pub fn log_format() -> String {
-    std::env::var(ENV_LOG_FORMAT).unwrap_or_else(|_| "json".to_owned())
 }
 
 /// `true` when a custom S3 endpoint is configured (`LocalStack`, `MinIO`, etc.) —
@@ -315,31 +297,6 @@ fn parse_checkpoint_mode(s: &str) -> Result<CheckpointMode> {
         "off" | "skip" | "none" => Ok(CheckpointMode::Off),
         other => Err(anyhow!("unknown checkpoint mode '{other}'")),
     }
-}
-
-/// Initialize tracing. Idempotent — safe to call from both `lib` and `bin`.
-///
-/// Honors `RUST_LOG`; falls back to `LOG_LEVEL`; finally to [`DEFAULT_LOG_LEVEL`].
-/// Format is selected by [`log_format`]:
-/// - `json` (default) → structured one-line JSON per event, required fields per the sops logging spec
-/// - `pretty` / `text` / `human` → human-readable console output for local dev
-pub fn init_logging() {
-    INIT.call_once(|| {
-        let filter = EnvFilter::try_from_default_env()
-            .or_else(|_| {
-                let level = std::env::var("LOG_LEVEL").unwrap_or_else(|_| DEFAULT_LOG_LEVEL.to_owned());
-                EnvFilter::try_new(level)
-            })
-            .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_LEVEL));
-
-        let fmt = tracing_subscriber::fmt().with_env_filter(filter).with_target(true);
-        let format = log_format();
-        if matches!(format.to_ascii_lowercase().as_str(), "pretty" | "text" | "human") {
-            fmt.init();
-        } else {
-            fmt.event_format(JsonEventFormatter::new(SERVICE_NAME, environment())).init();
-        }
-    });
 }
 
 #[cfg(test)]
