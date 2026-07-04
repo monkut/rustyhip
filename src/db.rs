@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
@@ -136,6 +137,11 @@ impl SqliteDb {
             }
         };
         apply_pragmas(&conn, &settings);
+        // Installed AFTER apply_pragmas so bootstrap-time configuration (which
+        // uses value-form pragmas) is unaffected. From here on every prepared
+        // statement — client SQL and the internal wal_checkpoint alike — goes
+        // through `authorize_action`.
+        conn.authorizer(Some(|ctx: AuthContext<'_>| authorize_action(&ctx.action)));
         Ok(Self { conn: Arc::new(Mutex::new(conn)), path, settings })
     }
 
@@ -239,6 +245,53 @@ impl SqliteDb {
         }
         result
     }
+}
+
+/// Statement-surface policy, enforced via the `SQLite` authorizer on every
+/// prepared statement (monkut/rustyhip#18):
+///
+/// - `ATTACH` / `DETACH` are denied — an attached database bypasses the
+///   turbolite VFS, so anything written there silently never reaches S3, and
+///   the filename argument would allow reading/writing arbitrary container
+///   filesystem paths.
+/// - `PRAGMA` is denied except:
+///   - `wal_checkpoint` (any form) — it *is* the durability flush and is
+///     harmless when a client triggers it early;
+///   - argument-taking introspection pragmas (`table_info`, `index_list`, …)
+///     which never write;
+///   - any pragma in read form (no value) — reconfiguring the shared
+///     long-lived connection (`journal_mode`, `synchronous`, …) is what we
+///     must prevent, and every config change requires the value form.
+/// - Everything else (DML, DDL, transactions, reads) is allowed.
+fn authorize_action(action: &AuthAction<'_>) -> Authorization {
+    match action {
+        AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
+        AuthAction::Pragma { pragma_name, pragma_value } => authorize_pragma(pragma_name, pragma_value.is_some()),
+        _ => Authorization::Allow,
+    }
+}
+
+/// Introspection pragmas whose argument selects *what to read* (a table, an
+/// index, a row budget) — safe in both no-arg and arg forms.
+const ARG_SAFE_PRAGMAS: &[&str] = &[
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_list",
+    "index_info",
+    "index_xinfo",
+    "foreign_key_list",
+    "foreign_key_check",
+    "integrity_check",
+    "quick_check",
+];
+
+fn authorize_pragma(name: &str, has_value: bool) -> Authorization {
+    let lower = name.to_ascii_lowercase();
+    if lower == "wal_checkpoint" || ARG_SAFE_PRAGMAS.contains(&lower.as_str()) {
+        return Authorization::Allow;
+    }
+    if has_value { Authorization::Deny } else { Authorization::Allow }
 }
 
 /// Run `PRAGMA wal_checkpoint(<arg>)` through a lean path — no JSON row
@@ -567,6 +620,46 @@ mod tests {
             .await
             .expect_err("checkpoint should report busy");
         assert!(matches!(err, ExecError::Checkpoint(_)), "unexpected error variant: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn attach_is_denied() {
+        let (_f, db) = empty_db();
+        let err = db
+            .exec("ATTACH DATABASE '/tmp/rustyhip-escape.db' AS x".into(), vec![])
+            .await
+            .expect_err("ATTACH must be rejected");
+        assert!(err.chain().any(|e| e.to_string().contains("not authorized")), "unexpected error: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn config_altering_pragma_is_denied() {
+        let (_f, db) = empty_db();
+        for sql in ["PRAGMA journal_mode = DELETE", "PRAGMA synchronous = OFF", "PRAGMA wal_autocheckpoint = 0"] {
+            let err = db.exec(sql.into(), vec![]).await.expect_err("value-form pragma must be rejected");
+            assert!(err.chain().any(|e| e.to_string().contains("not authorized")), "{sql}: {err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn introspection_pragmas_are_allowed() {
+        let (_f, db) = empty_db();
+        exec_sql(&db, "CREATE TABLE fruit (id INTEGER PRIMARY KEY, name TEXT)").await;
+        let out = db.exec("PRAGMA table_info(fruit)".into(), vec![]).await.expect("table_info allowed");
+        assert_eq!(out.rows.len(), 2);
+        // Read form of a config pragma is harmless and stays available.
+        db.exec("PRAGMA journal_mode".into(), vec![]).await.expect("read form allowed");
+    }
+
+    /// The internal durability flush must survive the authorizer (it runs
+    /// through the same connection).
+    #[tokio::test]
+    async fn internal_checkpoint_still_works_with_authorizer() {
+        let (_f, db) = wal_mode_db();
+        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], CheckpointMode::Truncate)
+            .await
+            .expect("checkpointed write with authorizer installed");
+        assert_eq!(wal_size(db.path()), 0);
     }
 
     #[tokio::test]

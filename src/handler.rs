@@ -21,6 +21,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use lambda_http::{Body, Error, Request, RequestExt, Response, http::StatusCode};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tracing::{debug, error, info, warn};
 
 use crate::VERSION;
@@ -94,6 +95,13 @@ fn health() -> Result<Response<Body>, Error> {
     json_response(StatusCode::OK, &HealthResponse { version: VERSION, status: "ok" })
 }
 
+/// Extract the token from an `Authorization` header value. Per RFC 7235 the
+/// auth-scheme name is case-insensitive (`Bearer` / `bearer` / `BEARER`).
+fn bearer_token(header_value: &str) -> Option<&str> {
+    let (scheme, token) = header_value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
+}
+
 /// Returns `Err(response)` when auth fails — caller short-circuits with it.
 /// The Err variant intentionally carries a full `Response<Body>` so the caller
 /// can return it verbatim; clippy's `result_large_err` is noise here.
@@ -102,12 +110,10 @@ fn check_auth(state: &AppState, req: &Request, request_id: &str) -> Result<(), R
     let Some(expected) = state.auth_token.as_deref() else {
         return Ok(());
     };
-    let provided = req
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")));
-    if provided == Some(expected) {
+    let provided = req.headers().get("authorization").and_then(|v| v.to_str().ok()).and_then(bearer_token);
+    // Constant-time comparison — a short-circuiting `==` on the shared secret
+    // would leak how many leading bytes matched through response timing.
+    if provided.is_some_and(|p| bool::from(p.as_bytes().ct_eq(expected.as_bytes()))) {
         return Ok(());
     }
     warn!(%request_id, "auth failed — rejecting request");
@@ -321,6 +327,29 @@ mod tests {
         let (_dir, state) = make_state(Some("expected-token"));
         let resp = handle(state, make_request("GET", "/health", "", Some("expected-token"))).await.expect("handler");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// RFC 7235: the auth-scheme name is case-insensitive.
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive() {
+        let (_dir, state) = make_state(Some("expected-token"));
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/health")
+            .header("authorization", "BEARER expected-token")
+            .body(Body::from(String::new()))
+            .expect("build request");
+        let resp = handle(state, req).await.expect("handler");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn bearer_token_extraction() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearerabc"), None);
     }
 
     #[tokio::test]

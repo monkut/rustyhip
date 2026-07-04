@@ -156,6 +156,24 @@ for correctness on the current turbolite VFS — see issue #1 (multi-writer
 support) and `CLAUDE.md` (Lambda ephemeral compute architecture). Do not
 raise this without first reading both.
 
+### Statement policy
+
+`POST /sql` accepts a single SQL statement per request (multi-statement
+bodies are rejected at prepare time). A SQLite authorizer additionally
+denies statements that could escape or reconfigure the database
+(`RUSTYHIP_E_SQL`, "not authorized"):
+
+| Denied | Why |
+|--------|-----|
+| `ATTACH` / `DETACH` | An attached database bypasses the turbolite VFS — writes there silently never reach S3, and the filename argument reads/writes arbitrary container paths. |
+| Value-form `PRAGMA` (e.g. `PRAGMA journal_mode = DELETE`) | Reconfigures the shared long-lived connection and can undo the durability setup. |
+
+Still allowed: all DML/DDL/queries, explicit transactions, read-form
+pragmas (`PRAGMA journal_mode`), argument-taking introspection pragmas
+(`PRAGMA table_info(t)`, `integrity_check`, …), and `PRAGMA
+wal_checkpoint` (it is the durability flush itself, safe to trigger
+early).
+
 ## Configuration
 
 All knobs are environment variables read once at Lambda cold-start. Bad

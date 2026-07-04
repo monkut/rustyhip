@@ -2559,6 +2559,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "time",
  "tokio",
