@@ -15,7 +15,7 @@ use std::time::Instant;
 use anyhow::Context;
 use lambda_http::{Error, run, service_fn};
 use rustyhip::db::{DbSettings, SqliteDb};
-use rustyhip::logging::elapsed_ms;
+use rustyhip::logging::{elapsed_ms, init_logging};
 use rustyhip::settings::CheckpointMode;
 use rustyhip::state::AppState;
 use rustyhip::{VERSION, handler, settings};
@@ -26,7 +26,7 @@ const VFS_NAME: &str = "tiered";
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    settings::init_logging();
+    init_logging();
     let started = Instant::now();
     info!(
         op = "bootstrap",

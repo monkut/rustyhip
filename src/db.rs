@@ -12,14 +12,48 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::{debug, info};
 
 use crate::logging::elapsed_ms;
-use crate::settings::{ConfigKnobs, JournalMode, Synchronous, TempStore};
+use crate::settings::{CheckpointMode, ConfigKnobs, JournalMode, Synchronous, TempStore};
+
+/// Failure modes of [`SqliteDb::exec_durable`], split so the HTTP layer can map
+/// them to distinct status codes without string-matching.
+#[derive(Debug)]
+pub enum ExecError {
+    /// Statement preparation/execution failed — a client error (bad SQL,
+    /// missing table, parameter mismatch, …).
+    Sql(anyhow::Error),
+    /// The statement succeeded but the durability checkpoint did not complete —
+    /// the write may not have reached S3 and must not be acked.
+    Checkpoint(anyhow::Error),
+    /// Worker/runtime failure (blocking task panicked or was cancelled).
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for ExecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `{:#}` surfaces the full anyhow context chain in one line.
+        let (Self::Sql(e) | Self::Checkpoint(e) | Self::Internal(e)) = self;
+        write!(f, "{e:#}")
+    }
+}
+
+impl std::error::Error for ExecError {}
+
+/// Result row of `PRAGMA wal_checkpoint(...)`: `(busy, log, checkpointed)`.
+/// `busy != 0` means the checkpoint could not run to completion.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointStats {
+    pub busy: i64,
+    pub log: i64,
+    pub checkpointed: i64,
+}
 
 /// Subset of [`ConfigKnobs`] consumed by the DB layer. Cloned into [`SqliteDb`]
 /// so per-request callers don't re-read env.
@@ -64,16 +98,35 @@ pub struct SqliteDb {
     settings: DbSettings,
 }
 
+/// Shape of each element of [`ExecOutcome::rows`], selected per request via
+/// the `rows_format` body field (monkut/rustyhip#23).
+///
+/// `Objects` (default, backward-compatible) repeats every column name in every
+/// row; `Arrays` emits each row as a plain value array aligned with
+/// [`ExecOutcome::columns`], cutting both serialization work and payload size
+/// for large results.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RowsFormat {
+    #[default]
+    Objects,
+    Arrays,
+}
+
 /// Result of executing a single SQL statement.
 #[derive(Debug, Serialize)]
 pub struct ExecOutcome {
     /// Column names in declaration order (empty for non-`SELECT`).
     pub columns: Vec<String>,
-    /// Result rows keyed by column name (empty for non-`SELECT`).
+    /// Result rows (empty for non-`SELECT`): objects keyed by column name, or
+    /// value arrays aligned with `columns` — see [`RowsFormat`].
     pub rows: Vec<Value>,
-    /// Rows changed by the statement (0 for `SELECT` / DDL).
+    /// Rows changed by the statement. Always 0 for read-only statements
+    /// (`SELECT`, read-form pragmas); 0 for DDL.
     pub rowcount: i64,
-    /// `last_insert_rowid` after the statement (0 when no `INSERT` has occurred in this connection).
+    /// `last_insert_rowid` after a write statement (0 for read-only
+    /// statements; for non-`INSERT` writes it carries the connection's most
+    /// recent `INSERT` rowid).
     pub lastrowid: i64,
     /// `true` when the statement produced no schema/data changes (e.g. `SELECT`, read-only pragma).
     pub readonly: bool,
@@ -103,6 +156,11 @@ impl SqliteDb {
             }
         };
         apply_pragmas(&conn, &settings);
+        // Installed AFTER apply_pragmas so bootstrap-time configuration (which
+        // uses value-form pragmas) is unaffected. From here on every prepared
+        // statement — client SQL and the internal wal_checkpoint alike — goes
+        // through `authorize_action`.
+        conn.authorizer(Some(|ctx: AuthContext<'_>| authorize_action(&ctx.action)));
         Ok(Self { conn: Arc::new(Mutex::new(conn)), path, settings })
     }
 
@@ -117,7 +175,37 @@ impl SqliteDb {
     }
 
     /// Run `sql` (optionally with `params`) and return rows + change metadata.
+    /// No durability checkpoint — tests and local tooling only. Production
+    /// callers use [`Self::exec_durable`].
     pub async fn exec(&self, sql: String, params: Vec<Value>) -> Result<ExecOutcome> {
+        self.exec_durable(sql, params, RowsFormat::Objects, CheckpointMode::Off).await.map_err(|e| match e {
+            ExecError::Sql(e) | ExecError::Checkpoint(e) | ExecError::Internal(e) => e,
+        })
+    }
+
+    /// Run `sql`, then — when the statement leaves durable work in the WAL —
+    /// run `PRAGMA wal_checkpoint(<mode>)` **in the same blocking task, under
+    /// the same connection lock**, so the canonical state lands in S3 (via the
+    /// turbolite VFS) before the caller acks. See `CLAUDE.md`.
+    ///
+    /// Checkpoint gating: `sqlite3_stmt_readonly` reports transaction-control
+    /// statements (`BEGIN`/`COMMIT`/`ROLLBACK`/…) as read-only, so the readonly
+    /// flag alone would skip the flush of a committed transaction. Instead we
+    /// checkpoint when the connection is in autocommit after the statement AND
+    /// (the statement wrote, OR it just closed an explicit transaction).
+    /// Statements *inside* an open transaction are never checkpointed —
+    /// uncommitted frames cannot be flushed, and until `COMMIT` returns the
+    /// client holds no durability promise for them.
+    ///
+    /// A checkpoint that reports `busy != 0` did not flush everything and is
+    /// surfaced as [`ExecError::Checkpoint`] — callers must not ack the write.
+    pub async fn exec_durable(
+        &self,
+        sql: String,
+        params: Vec<Value>,
+        rows_format: RowsFormat,
+        mode: CheckpointMode,
+    ) -> Result<ExecOutcome, ExecError> {
         let started = Instant::now();
         let sql_bytes = sql.len();
         let param_count = params.len();
@@ -125,12 +213,36 @@ impl SqliteDb {
 
         let conn = self.conn.clone();
         let settings = self.settings.clone();
-        let result: Result<ExecOutcome> = tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().map_err(|e| anyhow!("connection mutex poisoned: {e}"))?;
-            run_exec_with_settings(&guard, &sql, params, &settings)
+        let result: Result<ExecOutcome, ExecError> = tokio::task::spawn_blocking(move || {
+            let guard = conn.lock().map_err(|e| ExecError::Internal(anyhow!("connection mutex poisoned: {e}")))?;
+            let was_in_txn = !guard.is_autocommit();
+            let outcome =
+                run_exec_with_settings(&guard, &sql, params, rows_format, &settings).map_err(ExecError::Sql)?;
+            let needs_checkpoint = guard.is_autocommit() && (!outcome.readonly || was_in_txn);
+            if needs_checkpoint && let Some(arg) = mode.as_pragma_arg() {
+                let stats = run_checkpoint(&guard, arg).map_err(ExecError::Checkpoint)?;
+                info!(
+                    op = "db_checkpoint",
+                    mode = arg,
+                    busy = stats.busy,
+                    log = stats.log,
+                    checkpointed = stats.checkpointed,
+                    "post-write wal_checkpoint"
+                );
+                if stats.busy != 0 {
+                    return Err(ExecError::Checkpoint(anyhow!(
+                        "wal_checkpoint({arg}) could not complete (busy={}, log={}, checkpointed={})",
+                        stats.busy,
+                        stats.log,
+                        stats.checkpointed
+                    )));
+                }
+            }
+            drop(guard);
+            Ok(outcome)
         })
         .await
-        .context("sqlite worker panicked")?;
+        .map_err(|e| ExecError::Internal(anyhow!("sqlite worker panicked: {e}")))?;
 
         match &result {
             Ok(o) => info!(
@@ -148,12 +260,70 @@ impl SqliteDb {
                 phase = "end",
                 duration_ms = elapsed_ms(started),
                 outcome = "error",
-                error = %format_args!("{e:#}"),
+                error = %e,
                 "END db_exec"
             ),
         }
         result
     }
+}
+
+/// Statement-surface policy, enforced via the `SQLite` authorizer on every
+/// prepared statement (monkut/rustyhip#18):
+///
+/// - `ATTACH` / `DETACH` are denied — an attached database bypasses the
+///   turbolite VFS, so anything written there silently never reaches S3, and
+///   the filename argument would allow reading/writing arbitrary container
+///   filesystem paths.
+/// - `PRAGMA` is denied except:
+///   - `wal_checkpoint` (any form) — it *is* the durability flush and is
+///     harmless when a client triggers it early;
+///   - argument-taking introspection pragmas (`table_info`, `index_list`, …)
+///     which never write;
+///   - any pragma in read form (no value) — reconfiguring the shared
+///     long-lived connection (`journal_mode`, `synchronous`, …) is what we
+///     must prevent, and every config change requires the value form.
+/// - Everything else (DML, DDL, transactions, reads) is allowed.
+fn authorize_action(action: &AuthAction<'_>) -> Authorization {
+    match action {
+        AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
+        AuthAction::Pragma { pragma_name, pragma_value } => authorize_pragma(pragma_name, pragma_value.is_some()),
+        _ => Authorization::Allow,
+    }
+}
+
+/// Introspection pragmas whose argument selects *what to read* (a table, an
+/// index, a row budget) — safe in both no-arg and arg forms.
+const ARG_SAFE_PRAGMAS: &[&str] = &[
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_list",
+    "index_info",
+    "index_xinfo",
+    "foreign_key_list",
+    "foreign_key_check",
+    "integrity_check",
+    "quick_check",
+];
+
+fn authorize_pragma(name: &str, has_value: bool) -> Authorization {
+    let lower = name.to_ascii_lowercase();
+    if lower == "wal_checkpoint" || ARG_SAFE_PRAGMAS.contains(&lower.as_str()) {
+        return Authorization::Allow;
+    }
+    if has_value { Authorization::Deny } else { Authorization::Allow }
+}
+
+/// Run `PRAGMA wal_checkpoint(<arg>)` through a lean path — no JSON row
+/// materialization — and return its `(busy, log, checkpointed)` result row.
+/// On a non-WAL database `SQLite` returns `(0, -1, -1)`, i.e. success.
+fn run_checkpoint(conn: &Connection, arg: &str) -> Result<CheckpointStats> {
+    let sql = format!("PRAGMA wal_checkpoint({arg})");
+    conn.query_row(&sql, [], |row| {
+        Ok(CheckpointStats { busy: row.get(0)?, log: row.get(1)?, checkpointed: row.get(2)? })
+    })
+    .with_context(|| format!("run {sql}"))
 }
 
 /// Wrap [`run_exec`] with timeout enforcement (`RUSTYHIP_QUERY_TIMEOUT_MS`) via
@@ -165,6 +335,7 @@ fn run_exec_with_settings(
     conn: &Connection,
     sql: &str,
     params: Vec<Value>,
+    rows_format: RowsFormat,
     settings: &DbSettings,
 ) -> Result<ExecOutcome> {
     let timeout_installed = settings.query_timeout_ms.is_some();
@@ -174,7 +345,7 @@ fn run_exec_with_settings(
         // without measurably moving the floor (see results/benchmarks.md).
         conn.progress_handler(10_000, Some(move || Instant::now() > deadline));
     }
-    let result = run_exec(conn, sql, params, settings.max_rows);
+    let result = run_exec(conn, sql, params, settings.max_rows, rows_format);
     if timeout_installed {
         conn.progress_handler::<fn() -> bool>(0, None);
     }
@@ -199,7 +370,13 @@ fn error_is_interrupt(e: &anyhow::Error) -> bool {
     })
 }
 
-fn run_exec(conn: &Connection, sql: &str, params: Vec<Value>, max_rows: Option<usize>) -> Result<ExecOutcome> {
+fn run_exec(
+    conn: &Connection,
+    sql: &str,
+    params: Vec<Value>,
+    max_rows: Option<usize>,
+    rows_format: RowsFormat,
+) -> Result<ExecOutcome> {
     let bind_params: Vec<SqlValue> = params.into_iter().map(json_to_sql).collect::<Result<_>>()?;
 
     let mut stmt = conn.prepare(sql).context("prepare statement")?;
@@ -215,18 +392,35 @@ fn run_exec(conn: &Connection, sql: &str, params: Vec<Value>, max_rows: Option<u
         {
             return Err(anyhow!("result exceeded RUSTYHIP_MAX_ROWS={cap}; refusing to materialize more rows"));
         }
-        let mut obj = Map::with_capacity(col_count);
-        for (i, name) in columns.iter().enumerate() {
-            let raw: SqlValue = row.get(i).with_context(|| format!("read column {i}"))?;
-            obj.insert(name.clone(), sql_to_json(raw));
-        }
-        rows.push(Value::Object(obj));
+        let value = match rows_format {
+            RowsFormat::Objects => {
+                let mut obj = Map::with_capacity(col_count);
+                for (i, name) in columns.iter().enumerate() {
+                    let raw: SqlValue = row.get(i).with_context(|| format!("read column {i}"))?;
+                    obj.insert(name.clone(), sql_to_json(raw));
+                }
+                Value::Object(obj)
+            }
+            RowsFormat::Arrays => {
+                let mut arr = Vec::with_capacity(col_count);
+                for i in 0..col_count {
+                    let raw: SqlValue = row.get(i).with_context(|| format!("read column {i}"))?;
+                    arr.push(sql_to_json(raw));
+                }
+                Value::Array(arr)
+            }
+        };
+        rows.push(value);
     }
     drop(rows_iter);
     drop(stmt);
 
-    let rowcount = i64::try_from(conn.changes()).unwrap_or(i64::MAX);
-    let lastrowid = conn.last_insert_rowid();
+    // sqlite3_changes / last_insert_rowid are connection-scoped and NOT reset
+    // by read-only statements — reading them here for a SELECT would leak the
+    // counters of a previous, unrelated request on this shared connection
+    // (monkut/rustyhip#20). Report 0 for read-only statements instead.
+    let (rowcount, lastrowid) =
+        if readonly { (0, 0) } else { (i64::try_from(conn.changes()).unwrap_or(i64::MAX), conn.last_insert_rowid()) };
     Ok(ExecOutcome { columns, rows, rowcount, lastrowid, readonly })
 }
 
@@ -359,6 +553,39 @@ mod tests {
         assert_eq!(out.rows[0]["name"], "peach");
     }
 
+    /// Regression for monkut/rustyhip#20: a SELECT after an INSERT on the same
+    /// (shared, long-lived) connection must not report the INSERT's counters.
+    #[tokio::test]
+    async fn select_does_not_leak_previous_write_counters() {
+        let (_f, db) = empty_db();
+        exec_sql(&db, "CREATE TABLE fruit (id INTEGER PRIMARY KEY, name TEXT)").await;
+        let write = exec_sql(&db, "INSERT INTO fruit (name) VALUES ('apple'), ('peach')").await;
+        assert_eq!(write.rowcount, 2);
+        assert_eq!(write.lastrowid, 2);
+        let read = exec_sql(&db, "SELECT name FROM fruit").await;
+        assert_eq!(read.rowcount, 0, "SELECT must report rowcount 0");
+        assert_eq!(read.lastrowid, 0, "SELECT must report lastrowid 0");
+    }
+
+    #[tokio::test]
+    async fn rows_format_arrays_aligns_with_columns() {
+        let (_f, db) = empty_db();
+        exec_sql(&db, "CREATE TABLE fruit (id INTEGER PRIMARY KEY, name TEXT)").await;
+        exec_sql(&db, "INSERT INTO fruit (name) VALUES ('apple'), ('peach')").await;
+        let out = db
+            .exec_durable(
+                "SELECT id, name FROM fruit ORDER BY id".into(),
+                vec![],
+                RowsFormat::Arrays,
+                CheckpointMode::Off,
+            )
+            .await
+            .expect("select");
+        assert_eq!(out.columns, vec!["id".to_owned(), "name".to_owned()]);
+        assert_eq!(out.rows[0], serde_json::json!([1, "apple"]));
+        assert_eq!(out.rows[1], serde_json::json!([2, "peach"]));
+    }
+
     #[tokio::test]
     async fn missing_table_returns_error() {
         let (_f, db) = empty_db();
@@ -403,6 +630,122 @@ mod tests {
         db.exec("INSERT INTO t VALUES (1),(2),(3),(4)".into(), vec![]).await.expect("seed");
         let out = db.exec("SELECT id FROM t".into(), vec![]).await.expect("select");
         assert_eq!(out.rows.len(), 4);
+    }
+
+    /// WAL sidecar size in bytes (0 when the file doesn't exist yet).
+    fn wal_size(db_path: &Path) -> u64 {
+        let mut wal = db_path.as_os_str().to_owned();
+        wal.push("-wal");
+        std::fs::metadata(&wal).map_or(0, |m| m.len())
+    }
+
+    fn wal_mode_db() -> (NamedTempFile, SqliteDb) {
+        let file = NamedTempFile::new().expect("tempfile");
+        let settings = DbSettings { journal_mode: Some(JournalMode::Wal), ..DbSettings::default() };
+        let db = SqliteDb::open_with(file.path().to_owned(), None, settings).expect("open");
+        (file, db)
+    }
+
+    #[tokio::test]
+    async fn plain_write_checkpoint_truncates_wal() {
+        let (_f, db) = wal_mode_db();
+        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
+            .await
+            .expect("create");
+        assert_eq!(wal_size(db.path()), 0, "wal should be truncated after a checkpointed write");
+    }
+
+    #[tokio::test]
+    async fn readonly_select_does_not_checkpoint() {
+        let (_f, db) = wal_mode_db();
+        // Write WITHOUT a checkpoint so frames stay in the WAL…
+        db.exec("CREATE TABLE t (x INTEGER)".into(), vec![]).await.expect("create");
+        let before = wal_size(db.path());
+        assert!(before > 0, "un-checkpointed write should leave WAL frames");
+        // …then a readonly SELECT with checkpointing enabled must not flush them.
+        db.exec_durable("SELECT * FROM t".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
+            .await
+            .expect("select");
+        assert_eq!(wal_size(db.path()), before, "readonly statement must not checkpoint");
+    }
+
+    /// Regression for monkut/rustyhip#17: `sqlite3_stmt_readonly` reports
+    /// COMMIT as readonly, so gating the checkpoint on the statement's readonly
+    /// flag alone would leave a committed transaction sitting in the local WAL.
+    #[tokio::test]
+    async fn commit_of_explicit_transaction_is_checkpointed() {
+        let (_f, db) = wal_mode_db();
+        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
+            .await
+            .expect("create");
+        db.exec_durable("BEGIN".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate).await.expect("begin");
+        db.exec_durable("INSERT INTO t VALUES (1)".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
+            .await
+            .expect("insert in txn");
+        db.exec_durable("COMMIT".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate).await.expect("commit");
+        assert_eq!(wal_size(db.path()), 0, "COMMIT must flush the transaction out of the WAL");
+        let out = db.exec("SELECT x FROM t".into(), vec![]).await.expect("select");
+        assert_eq!(out.rows.len(), 1);
+    }
+
+    /// A checkpoint that cannot complete (`busy != 0`) must fail the call —
+    /// acking a write whose frames are still local-only would violate the
+    /// durability contract (CLAUDE.md).
+    #[tokio::test]
+    async fn blocked_checkpoint_surfaces_as_checkpoint_error() {
+        let (file, db) = wal_mode_db();
+        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
+            .await
+            .expect("create");
+        // Second connection holds an open read snapshot, preventing WAL reset.
+        let reader = Connection::open(file.path()).expect("open reader");
+        reader.execute_batch("BEGIN").expect("begin read txn");
+        let _count: i64 = reader.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).expect("acquire read snapshot");
+        let err = db
+            .exec_durable("INSERT INTO t VALUES (1)".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
+            .await
+            .expect_err("checkpoint should report busy");
+        assert!(matches!(err, ExecError::Checkpoint(_)), "unexpected error variant: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn attach_is_denied() {
+        let (_f, db) = empty_db();
+        let err = db
+            .exec("ATTACH DATABASE '/tmp/rustyhip-escape.db' AS x".into(), vec![])
+            .await
+            .expect_err("ATTACH must be rejected");
+        assert!(err.chain().any(|e| e.to_string().contains("not authorized")), "unexpected error: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn config_altering_pragma_is_denied() {
+        let (_f, db) = empty_db();
+        for sql in ["PRAGMA journal_mode = DELETE", "PRAGMA synchronous = OFF", "PRAGMA wal_autocheckpoint = 0"] {
+            let err = db.exec(sql.into(), vec![]).await.expect_err("value-form pragma must be rejected");
+            assert!(err.chain().any(|e| e.to_string().contains("not authorized")), "{sql}: {err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn introspection_pragmas_are_allowed() {
+        let (_f, db) = empty_db();
+        exec_sql(&db, "CREATE TABLE fruit (id INTEGER PRIMARY KEY, name TEXT)").await;
+        let out = db.exec("PRAGMA table_info(fruit)".into(), vec![]).await.expect("table_info allowed");
+        assert_eq!(out.rows.len(), 2);
+        // Read form of a config pragma is harmless and stays available.
+        db.exec("PRAGMA journal_mode".into(), vec![]).await.expect("read form allowed");
+    }
+
+    /// The internal durability flush must survive the authorizer (it runs
+    /// through the same connection).
+    #[tokio::test]
+    async fn internal_checkpoint_still_works_with_authorizer() {
+        let (_f, db) = wal_mode_db();
+        db.exec_durable("CREATE TABLE t (x INTEGER)".into(), vec![], RowsFormat::Objects, CheckpointMode::Truncate)
+            .await
+            .expect("checkpointed write with authorizer installed");
+        assert_eq!(wal_size(db.path()), 0);
     }
 
     #[tokio::test]

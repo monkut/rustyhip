@@ -156,6 +156,38 @@ for correctness on the current turbolite VFS — see issue #1 (multi-writer
 support) and `CLAUDE.md` (Lambda ephemeral compute architecture). Do not
 raise this without first reading both.
 
+### Statement policy
+
+`POST /sql` accepts a single SQL statement per request (multi-statement
+bodies are rejected at prepare time). A SQLite authorizer additionally
+denies statements that could escape or reconfigure the database
+(`RUSTYHIP_E_SQL`, "not authorized"):
+
+| Denied | Why |
+|--------|-----|
+| `ATTACH` / `DETACH` | An attached database bypasses the turbolite VFS — writes there silently never reach S3, and the filename argument reads/writes arbitrary container paths. |
+| Value-form `PRAGMA` (e.g. `PRAGMA journal_mode = DELETE`) | Reconfigures the shared long-lived connection and can undo the durability setup. |
+
+Still allowed: all DML/DDL/queries, explicit transactions, read-form
+pragmas (`PRAGMA journal_mode`), argument-taking introspection pragmas
+(`PRAGMA table_info(t)`, `integrity_check`, …), and `PRAGMA
+wal_checkpoint` (it is the durability flush itself, safe to trigger
+early).
+
+### Wire format
+
+```
+POST /sql
+{"sql": "...", "params": [...]?, "rows_format": "objects" | "arrays"?}
+→ {"columns": [...], "rows": [...], "rowcount": N, "lastrowid": M, "readonly": bool}
+```
+
+`rows_format` (default `objects`) selects the shape of each element of
+`rows`: `objects` returns `{"col": value, ...}` per row; `arrays` returns
+a plain value array aligned with `columns` — for large results this cuts
+both serialization CPU and payload bytes, since column names are not
+repeated per row (see `select_wide_1k_*` in `results/benchmarks.md`).
+
 ## Configuration
 
 All knobs are environment variables read once at Lambda cold-start. Bad
@@ -210,6 +242,13 @@ levers if you can trade durability for throughput.
 | Env | Default | Purpose |
 |-----|---------|---------|
 | `RUSTYHIP_CHECKPOINT_MODE` | `truncate` | Post-write checkpoint mode: `truncate` / `restart` / `full` / `passive` / `off`. **`truncate` is the only Lambda-safe value.** Bootstrap logs a `warn!` when overridden. |
+
+The checkpoint runs for every `/sql` call that leaves durable work in the
+WAL — plain writes and the `COMMIT`/`ROLLBACK` that closes a client-driven
+explicit transaction. Statements *inside* an open transaction are acked
+without a checkpoint: no durability promise exists until `COMMIT` returns
+200. A checkpoint that cannot complete (`busy != 0`) fails the request
+with **500** `RUSTYHIP_E_INTERNAL` instead of acking a non-durable write.
 
 ### Turbolite (inherited, set independently of rustyhip)
 

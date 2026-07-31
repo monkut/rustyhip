@@ -1,7 +1,7 @@
 //! Local micro-benchmarks for rustyhip's HTTP handler against the default
 //! `SQLite` VFS (local file — no S3, no turbolite). Measures the CPU/SQLite
 //! floor; production adds turbolite page reads + a synchronous S3 checkpoint
-//! after every non-readonly /sql call (see `src/handler.rs:152-169`).
+//! after every non-readonly /sql call (see `SqliteDb::exec_durable` in `src/db.rs`).
 //!
 //! Run from project root:
 //!
@@ -155,6 +155,20 @@ async fn main() -> Result<()> {
             iterations: 100,
         },
         Op {
+            name: "select_wide_1k_objects",
+            method: "POST",
+            path: "/sql",
+            body: r#"{"sql":"SELECT id, ts, worker_id, payload, id AS c5, ts AS c6, worker_id AS c7, payload AS c8 FROM bench"}"#,
+            iterations: 50,
+        },
+        Op {
+            name: "select_wide_1k_arrays",
+            method: "POST",
+            path: "/sql",
+            body: r#"{"sql":"SELECT id, ts, worker_id, payload, id AS c5, ts AS c6, worker_id AS c7, payload AS c8 FROM bench","rows_format":"arrays"}"#,
+            iterations: 50,
+        },
+        Op {
             name: "insert_single",
             method: "POST",
             path: "/sql",
@@ -265,7 +279,7 @@ async fn main() -> Result<()> {
     writeln!(md)?;
     writeln!(md, "1. **turbolite tiered VFS page reads** — cold pages fetch from S3; warm pages hit")?;
     writeln!(md, "   the local `/tmp` page cache.")?;
-    writeln!(md, "2. **Synchronous S3 checkpoint after every write** — `src/handler.rs:152-169`")?;
+    writeln!(md, "2. **Synchronous S3 checkpoint after every write** — `SqliteDb::exec_durable` (`src/db.rs`)")?;
     writeln!(md, "   issues `PRAGMA wal_checkpoint(TRUNCATE)` on every non-readonly /sql call so the")?;
     writeln!(md, "   canonical state lands in S3 *before* the response returns. Expect inserts to be")?;
     writeln!(md, "   substantially slower in Lambda than the numbers below.")?;

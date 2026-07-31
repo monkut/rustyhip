@@ -3,7 +3,7 @@
 //! Wire format:
 //!   `GET  /`        → health
 //!   `GET  /health`  → health
-//!   `POST /sql`     → `{"sql": "...", "params": [...]?}`
+//!   `POST /sql`     → `{"sql": "...", "params": [...]?, "rows_format": "objects"|"arrays"?}`
 //!                   → `{"columns": [...], "rows": [...], "rowcount": N, "lastrowid": M, "readonly": bool}`
 //!
 //! Auth: when `RUSTYHIP_AUTH_TOKEN` is set, every request (including `/health`)
@@ -21,12 +21,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use lambda_http::{Body, Error, Request, RequestExt, Response, http::StatusCode};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tracing::{debug, error, info, warn};
 
 use crate::VERSION;
+use crate::db::{ExecError, RowsFormat};
 use crate::errors;
 use crate::logging::elapsed_ms;
-use crate::settings::CheckpointMode;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +35,10 @@ pub struct SqlRequest {
     pub sql: String,
     #[serde(default)]
     pub params: Vec<serde_json::Value>,
+    /// Row shape: `"objects"` (default) or `"arrays"` (rows aligned with
+    /// `columns` — smaller payloads for large results). See [`RowsFormat`].
+    #[serde(default)]
+    pub rows_format: RowsFormat,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,6 +99,13 @@ fn health() -> Result<Response<Body>, Error> {
     json_response(StatusCode::OK, &HealthResponse { version: VERSION, status: "ok" })
 }
 
+/// Extract the token from an `Authorization` header value. Per RFC 7235 the
+/// auth-scheme name is case-insensitive (`Bearer` / `bearer` / `BEARER`).
+fn bearer_token(header_value: &str) -> Option<&str> {
+    let (scheme, token) = header_value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
+}
+
 /// Returns `Err(response)` when auth fails — caller short-circuits with it.
 /// The Err variant intentionally carries a full `Response<Body>` so the caller
 /// can return it verbatim; clippy's `result_large_err` is noise here.
@@ -102,12 +114,10 @@ fn check_auth(state: &AppState, req: &Request, request_id: &str) -> Result<(), R
     let Some(expected) = state.auth_token.as_deref() else {
         return Ok(());
     };
-    let provided = req
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")));
-    if provided == Some(expected) {
+    let provided = req.headers().get("authorization").and_then(|v| v.to_str().ok()).and_then(bearer_token);
+    // Constant-time comparison — a short-circuiting `==` on the shared secret
+    // would leak how many leading bytes matched through response timing.
+    if provided.is_some_and(|p| bool::from(p.as_bytes().ct_eq(expected.as_bytes()))) {
         return Ok(());
     }
     warn!(%request_id, "auth failed — rejecting request");
@@ -123,25 +133,36 @@ fn check_auth(state: &AppState, req: &Request, request_id: &str) -> Result<(), R
     Err(resp)
 }
 
-async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response<Body>, Error> {
+/// Parse + validate the `/sql` request body. `Err` carries the ready-made
+/// error response so `sql` can early-return it verbatim.
+#[allow(clippy::result_large_err)]
+fn parse_sql_request(
+    state: &AppState,
+    body: &Body,
+    request_id: &str,
+) -> Result<SqlRequest, Result<Response<Body>, Error>> {
     let bytes: &[u8] = body.as_ref();
     if let Some(max) = state.max_body_bytes
         && bytes.len() > max
     {
         warn!(body_bytes = bytes.len(), max, %request_id, "request body exceeded RUSTYHIP_MAX_BODY_BYTES");
-        return json_error(
+        return Err(json_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             errors::VALIDATION,
             format!("request body of {} bytes exceeds RUSTYHIP_MAX_BODY_BYTES={max}", bytes.len()),
             request_id,
-        );
+        ));
     }
-    let req: SqlRequest = match serde_json::from_slice(bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "invalid JSON request body");
-            return json_error(StatusCode::BAD_REQUEST, errors::VALIDATION, format!("invalid JSON: {e}"), request_id);
-        }
+    serde_json::from_slice(bytes).map_err(|e| {
+        warn!(error = %e, "invalid JSON request body");
+        json_error(StatusCode::BAD_REQUEST, errors::VALIDATION, format!("invalid JSON: {e}"), request_id)
+    })
+}
+
+async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response<Body>, Error> {
+    let req = match parse_sql_request(state, body, request_id) {
+        Ok(req) => req,
+        Err(resp) => return resp,
     };
     let started = Instant::now();
     info!(
@@ -154,65 +175,41 @@ async fn sql(state: &AppState, body: &Body, request_id: &str) -> Result<Response
     );
     debug!(op = "handle_sql", sql = %req.sql, "sql text");
 
-    match state.db.exec(req.sql, req.params).await {
-        Ok(outcome) => {
-            // Writes live in turbolite's local WAL on /tmp until checkpoint; SQLite's
-            // default wal_autocheckpoint only fires every 1000 frames, so in a Lambda
-            // a container eviction between writes and checkpoint would silently drop
-            // data. Force a checkpoint after every non-readonly call — sync_mode=Durable
-            // (turbolite default) blocks it until the S3 manifest+pages land.
-            //
-            // The mode is configurable via RUSTYHIP_CHECKPOINT_MODE; Lambda must
-            // keep the default `Truncate` (see CLAUDE.md / state.rs).
-            if !outcome.readonly
-                && state.checkpoint_mode != CheckpointMode::Off
-                && let Some(arg) = state.checkpoint_mode.as_pragma_arg()
-            {
-                let sql = format!("PRAGMA wal_checkpoint({arg})");
-                if let Err(e) = state.db.exec(sql, vec![]).await {
-                    error!(error = ?e, mode = ?state.checkpoint_mode, "post-write checkpoint failed — write may not be durable in S3");
-                    info!(
-                        op = "handle_sql",
-                        phase = "end",
-                        duration_ms = elapsed_ms(started),
-                        outcome = "checkpoint_error",
-                        "END handle_sql"
-                    );
-                    return json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        errors::INTERNAL,
-                        format!("checkpoint failed: {e:#}"),
-                        request_id,
-                    );
-                }
-            }
-            let resp = json_response(StatusCode::OK, &outcome);
-            info!(
-                op = "handle_sql",
-                phase = "end",
-                duration_ms = elapsed_ms(started),
-                outcome = "ok",
-                readonly = outcome.readonly,
-                row_count = outcome.rows.len(),
-                rowcount = outcome.rowcount,
-                "END handle_sql"
-            );
-            resp
-        }
-        Err(e) => {
+    // Durability policy (when/how to run the post-write wal_checkpoint that
+    // pushes canonical state to S3 before the ack) lives in the DB layer —
+    // see `SqliteDb::exec_durable`. The handler only maps outcomes to HTTP.
+    // Row/column detail for the END event is already logged by `db_exec`.
+    let (outcome_label, resp) = match state
+        .db
+        .exec_durable(req.sql, req.params, req.rows_format, state.checkpoint_mode)
+        .await
+    {
+        Ok(outcome) => ("ok", json_response(StatusCode::OK, &outcome)),
+        Err(ExecError::Sql(e)) => {
             error!(error = ?e, "sql exec failed");
             // `{:#}` surfaces the full anyhow context chain (e.g. "prepare statement: no such table: foo").
-            let resp = json_error(StatusCode::BAD_REQUEST, errors::SQL, format!("{e:#}"), request_id);
-            info!(
-                op = "handle_sql",
-                phase = "end",
-                duration_ms = elapsed_ms(started),
-                outcome = "error",
-                "END handle_sql"
-            );
-            resp
+            ("error", json_error(StatusCode::BAD_REQUEST, errors::SQL, format!("{e:#}"), request_id))
         }
-    }
+        Err(e @ (ExecError::Checkpoint(_) | ExecError::Internal(_))) => {
+            let label = if matches!(e, ExecError::Checkpoint(_)) { "checkpoint_error" } else { "internal_error" };
+            error!(error = %e, mode = ?state.checkpoint_mode, "durable exec failed — write may not be durable in S3");
+            let resp = json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                errors::INTERNAL,
+                format!("durable exec failed: {e}"),
+                request_id,
+            );
+            (label, resp)
+        }
+    };
+    info!(
+        op = "handle_sql",
+        phase = "end",
+        duration_ms = elapsed_ms(started),
+        outcome = outcome_label,
+        "END handle_sql"
+    );
+    resp
 }
 
 fn json_response<T: Serialize>(status: StatusCode, payload: &T) -> Result<Response<Body>, Error> {
@@ -246,6 +243,7 @@ fn extract_request_id(req: &Request) -> String {
 mod tests {
     use super::*;
     use crate::db::SqliteDb;
+    use crate::settings::CheckpointMode;
     use lambda_http::http::Request as HttpRequest;
     use tempfile::TempDir;
 
@@ -330,6 +328,29 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// RFC 7235: the auth-scheme name is case-insensitive.
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive() {
+        let (_dir, state) = make_state(Some("expected-token"));
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/health")
+            .header("authorization", "BEARER expected-token")
+            .body(Body::from(String::new()))
+            .expect("build request");
+        let resp = handle(state, req).await.expect("handler");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn bearer_token_extraction() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearerabc"), None);
+    }
+
     #[tokio::test]
     async fn readonly_select_works_through_default_vfs() {
         let (_dir, state) = make_state(None);
@@ -341,6 +362,34 @@ mod tests {
         let body = parse_body(&resp);
         assert_eq!(body["readonly"], true);
         assert_eq!(body["rows"][0]["x"], 1);
+    }
+
+    #[tokio::test]
+    async fn rows_format_arrays_returns_value_arrays() {
+        let (_dir, state) = make_state(None);
+        state.db.exec("CREATE TABLE t (a INT, b TEXT)".into(), vec![]).await.expect("create");
+        state.db.exec("INSERT INTO t VALUES (1, 'x'), (2, 'y')".into(), vec![]).await.expect("insert");
+        let resp = handle(
+            state,
+            make_request("POST", "/sql", r#"{"sql":"SELECT a, b FROM t ORDER BY a","rows_format":"arrays"}"#, None),
+        )
+        .await
+        .expect("handler");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = parse_body(&resp);
+        assert_eq!(body["columns"], serde_json::json!(["a", "b"]));
+        assert_eq!(body["rows"], serde_json::json!([[1, "x"], [2, "y"]]));
+    }
+
+    #[tokio::test]
+    async fn rows_format_invalid_returns_400() {
+        let (_dir, state) = make_state(None);
+        let resp = handle(state, make_request("POST", "/sql", r#"{"sql":"SELECT 1","rows_format":"tuples"}"#, None))
+            .await
+            .expect("handler");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = parse_body(&resp);
+        assert_eq!(body["error"]["code"], errors::VALIDATION);
     }
 
     #[tokio::test]
@@ -362,6 +411,33 @@ mod tests {
         let resp =
             handle(state, make_request("POST", "/sql", r#"{"sql":"SELECT 1 AS one"}"#, None)).await.expect("handler");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// monkut/rustyhip#17: a client-driven BEGIN/INSERT/COMMIT across three
+    /// /sql calls must leave nothing in the local WAL after COMMIT is acked.
+    #[tokio::test]
+    async fn explicit_transaction_commit_is_checkpointed() {
+        use crate::db::DbSettings;
+        use crate::settings::JournalMode;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("rustyhip.db");
+        let settings = DbSettings { journal_mode: Some(JournalMode::Wal), ..DbSettings::default() };
+        let db = Arc::new(SqliteDb::open_with(db_path.clone(), None, settings).expect("open sqlite"));
+        let state = Arc::new(AppState::new(db, None)); // default CheckpointMode::Truncate
+
+        for sql in [
+            r#"{"sql":"CREATE TABLE t (x INTEGER)"}"#,
+            r#"{"sql":"BEGIN"}"#,
+            r#"{"sql":"INSERT INTO t VALUES (1)"}"#,
+            r#"{"sql":"COMMIT"}"#,
+        ] {
+            let resp = handle(state.clone(), make_request("POST", "/sql", sql, None)).await.expect("handler");
+            assert_eq!(resp.status(), StatusCode::OK, "failed on {sql}");
+        }
+        let wal = db_path.with_extension("db-wal");
+        let wal_len = std::fs::metadata(&wal).map_or(0, |m| m.len());
+        assert_eq!(wal_len, 0, "WAL must be empty after an acked COMMIT");
     }
 
     #[tokio::test]
