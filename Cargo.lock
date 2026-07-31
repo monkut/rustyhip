@@ -3363,7 +3363,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "turbolite"
 version = "0.4.1"
-source = "git+https://github.com/monkut/turbolite?rev=2901663a8040101723bdb2d34f9cae1535aca687#2901663a8040101723bdb2d34f9cae1535aca687"
+source = "git+https://github.com/monkut/turbolite?rev=82a21643a39f2dae0d48c91f3e1d11cb5b8ca761#82a21643a39f2dae0d48c91f3e1d11cb5b8ca761"
 dependencies = [
  "anyhow",
  "arc-swap",
