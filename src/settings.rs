@@ -230,18 +230,11 @@ pub fn config_knobs() -> ConfigKnobs {
         mmap_size: parse_env(ENV_MMAP_SIZE, |s| s.parse::<i64>().map_err(|e| anyhow!("{e}"))),
         temp_store: parse_env(ENV_TEMP_STORE, parse_temp_store),
         busy_timeout_ms: parse_env(ENV_BUSY_TIMEOUT_MS, |s| s.parse::<u32>().map_err(|e| anyhow!("{e}"))),
-        max_rows: parse_env(ENV_MAX_ROWS, |s| s.parse::<usize>().map_err(|e| anyhow!("{e}")))
-            .and_then(|n| if n == 0 { None } else { Some(n) }),
-        query_timeout_ms: parse_env(ENV_QUERY_TIMEOUT_MS, |s| s.parse::<u64>().map_err(|e| anyhow!("{e}"))).and_then(
-            |n| {
-                if n == 0 { None } else { Some(n) }
-            },
-        ),
-        max_body_bytes: parse_env(ENV_MAX_BODY_BYTES, |s| s.parse::<usize>().map_err(|e| anyhow!("{e}"))).and_then(
-            |n| {
-                if n == 0 { None } else { Some(n) }
-            },
-        ),
+        max_rows: parse_env(ENV_MAX_ROWS, |s| s.parse::<usize>().map_err(|e| anyhow!("{e}"))).filter(|&n| n != 0),
+        query_timeout_ms: parse_env(ENV_QUERY_TIMEOUT_MS, |s| s.parse::<u64>().map_err(|e| anyhow!("{e}")))
+            .filter(|&n| n != 0),
+        max_body_bytes: parse_env(ENV_MAX_BODY_BYTES, |s| s.parse::<usize>().map_err(|e| anyhow!("{e}")))
+            .filter(|&n| n != 0),
         checkpoint_mode: parse_env(ENV_CHECKPOINT_MODE, parse_checkpoint_mode).unwrap_or_default(),
     }
 }
