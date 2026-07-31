@@ -2996,7 +2996,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3363,7 +3363,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "turbolite"
 version = "0.4.1"
-source = "git+https://github.com/monkut/turbolite?rev=08c9182bdfa526f45909fe95ace5481cd58d9d82#08c9182bdfa526f45909fe95ace5481cd58d9d82"
+source = "git+https://github.com/monkut/turbolite?rev=82a21643a39f2dae0d48c91f3e1d11cb5b8ca761#82a21643a39f2dae0d48c91f3e1d11cb5b8ca761"
 dependencies = [
  "anyhow",
  "arc-swap",
