@@ -586,6 +586,21 @@ mod tests {
         assert_eq!(out.rows[1], serde_json::json!([2, "peach"]));
     }
 
+    /// Regression for monkut/rustyhip#29: JOINs legally produce duplicate
+    /// column names. Object-keyed rows collapse duplicates (later column
+    /// overwrites earlier); arrays mode must round-trip every value by
+    /// position.
+    #[tokio::test]
+    async fn rows_format_arrays_preserves_duplicate_column_names() {
+        let (_f, db) = empty_db();
+        let out = db
+            .exec_durable("SELECT 1 AS a, 2 AS a".into(), vec![], RowsFormat::Arrays, CheckpointMode::Off)
+            .await
+            .expect("select");
+        assert_eq!(out.columns, vec!["a".to_owned(), "a".to_owned()]);
+        assert_eq!(out.rows[0], serde_json::json!([1, 2]), "both duplicate-named columns must survive");
+    }
+
     #[tokio::test]
     async fn missing_table_returns_error() {
         let (_f, db) = empty_db();
