@@ -188,11 +188,15 @@ fn run_exec_with_settings(
     }
 }
 
-/// Walk the anyhow error chain looking for a `SQLite` "interrupted" / "interrupt"
-/// signal. The exact rusqlite message is "interrupted" but we match liberally
-/// to tolerate future libsqlite3 wording changes.
+/// Walk the anyhow error chain looking for a `SQLite` `SQLITE_INTERRUPT` code.
+/// Typed match against `rusqlite::Error::SqliteFailure` so we don't depend on
+/// the underlying libsqlite3 message wording.
 fn error_is_interrupt(e: &anyhow::Error) -> bool {
-    e.chain().any(|src| src.to_string().to_ascii_lowercase().contains("interrupt"))
+    e.chain().any(|src| {
+        src.downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code)
+            .is_some_and(|code| code == rusqlite::ffi::ErrorCode::OperationInterrupted)
+    })
 }
 
 fn run_exec(conn: &Connection, sql: &str, params: Vec<Value>, max_rows: Option<usize>) -> Result<ExecOutcome> {
