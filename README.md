@@ -174,6 +174,20 @@ pragmas (`PRAGMA journal_mode`), argument-taking introspection pragmas
 wal_checkpoint` (it is the durability flush itself, safe to trigger
 early).
 
+### Wire format
+
+```
+POST /sql
+{"sql": "...", "params": [...]?, "rows_format": "objects" | "arrays"?}
+→ {"columns": [...], "rows": [...], "rowcount": N, "lastrowid": M, "readonly": bool}
+```
+
+`rows_format` (default `objects`) selects the shape of each element of
+`rows`: `objects` returns `{"col": value, ...}` per row; `arrays` returns
+a plain value array aligned with `columns` — for large results this cuts
+both serialization CPU and payload bytes, since column names are not
+repeated per row (see `select_wide_1k_*` in `results/benchmarks.md`).
+
 ## Configuration
 
 All knobs are environment variables read once at Lambda cold-start. Bad

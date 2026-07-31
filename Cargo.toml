@@ -26,8 +26,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 time = { version = "0.3", features = ["formatting"] }
 lambda_http = { version = "0.13", default-features = false, features = ["apigw_rest", "apigw_http", "tracing"] }
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -37,6 +35,10 @@ turbolite = { version = "0.4", git = "https://github.com/monkut/turbolite", rev 
 
 [dev-dependencies]
 tempfile = "3"
+# Only the floci-backed CAS test (tests/cas_conflict.rs) talks to S3 directly —
+# production S3 I/O all goes through the turbolite VFS (see src/main.rs).
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
 
 # ----------------------------------------------------------------------------
 # Lints — rustc + clippy, surfaced in Cargo.toml (RFC 3389, stable since 1.74).

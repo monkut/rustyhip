@@ -155,6 +155,20 @@ async fn main() -> Result<()> {
             iterations: 100,
         },
         Op {
+            name: "select_wide_1k_objects",
+            method: "POST",
+            path: "/sql",
+            body: r#"{"sql":"SELECT id, ts, worker_id, payload, id AS c5, ts AS c6, worker_id AS c7, payload AS c8 FROM bench"}"#,
+            iterations: 50,
+        },
+        Op {
+            name: "select_wide_1k_arrays",
+            method: "POST",
+            path: "/sql",
+            body: r#"{"sql":"SELECT id, ts, worker_id, payload, id AS c5, ts AS c6, worker_id AS c7, payload AS c8 FROM bench","rows_format":"arrays"}"#,
+            iterations: 50,
+        },
+        Op {
             name: "insert_single",
             method: "POST",
             path: "/sql",
